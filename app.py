@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import threading
 from datetime import datetime, timedelta
 
@@ -35,37 +36,158 @@ def get_calendar_service():
     return build("calendar", "v3", credentials=creds)
 
 
-def create_event(text):
+def preprocess_text(text: str) -> str:
+    text = text.strip()
+    text = re.sub(r"下午(\d{1,2})點", lambda m: f"{int(m.group(1)) + 12}點", text)
+    text = re.sub(r"晚上(\d{1,2})點", lambda m: f"{int(m.group(1)) + 12}點", text)
+    text = text.replace("早上", "")
+    text = text.replace("上午", "")
+    return text
+
+
+def extract_time_and_task(text: str):
+    patterns = [
+        r"^(今天)(\d{1,2})點(?:(\d{1,2})分)?(.*)$",
+        r"^(明天)(\d{1,2})點(?:(\d{1,2})分)?(.*)$",
+        r"^(後天)(\d{1,2})點(?:(\d{1,2})分)?(.*)$",
+        r"^(今晚)(\d{1,2})點(?:(\d{1,2})分)?(.*)$",
+    ]
+
+    for pattern in patterns:
+        m = re.match(pattern, text)
+        if m:
+            day_word = m.group(1)
+            hour = int(m.group(2))
+            minute = int(m.group(3)) if m.group(3) else 0
+            task = m.group(4).strip() or "未命名行程"
+            return day_word, hour, minute, task
+
+    if text in ["今天出差", "明天出差", "後天出差"]:
+        return text[:2], "ALL_DAY", 0, "出差"
+
+    return None, None, None, text
+
+
+def build_datetime(day_word, hour, minute):
+    now = datetime.now()
+
+    if day_word == "今天":
+        base_date = now.date()
+    elif day_word == "明天":
+        base_date = (now + timedelta(days=1)).date()
+    elif day_word == "後天":
+        base_date = (now + timedelta(days=2)).date()
+    else:
+        return None
+
+    return datetime(
+        year=base_date.year,
+        month=base_date.month,
+        day=base_date.day,
+        hour=hour,
+        minute=minute,
+    )
+
+
+def create_calendar_event(summary, start_dt, end_dt):
     service = get_calendar_service()
 
-    now = datetime.now() + timedelta(minutes=1)
-    end = now + timedelta(hours=1)
-
     event = {
-        "summary": text,
-        "start": {"dateTime": now.isoformat(), "timeZone": "Asia/Taipei"},
-        "end": {"dateTime": end.isoformat(), "timeZone": "Asia/Taipei"},
+        "summary": summary,
+        "start": {
+            "dateTime": start_dt.isoformat(),
+            "timeZone": "Asia/Taipei",
+        },
+        "end": {
+            "dateTime": end_dt.isoformat(),
+            "timeZone": "Asia/Taipei",
+        },
+        "reminders": {
+            "useDefault": False,
+            "overrides": [
+                {"method": "popup", "minutes": 30},
+                {"method": "popup", "minutes": 15},
+            ],
+        },
     }
 
     return service.events().insert(calendarId="primary", body=event).execute()
 
 
+def create_all_day_event(summary, day_word):
+    now = datetime.now()
+
+    if day_word == "今天":
+        event_date = now.date()
+    elif day_word == "明天":
+        event_date = (now + timedelta(days=1)).date()
+    elif day_word == "後天":
+        event_date = (now + timedelta(days=2)).date()
+    else:
+        raise ValueError("未知日期")
+
+    service = get_calendar_service()
+
+    event = {
+        "summary": summary,
+        "start": {"date": event_date.isoformat()},
+        "end": {"date": (event_date + timedelta(days=1)).isoformat()},
+        "reminders": {
+            "useDefault": False,
+            "overrides": [{"method": "popup", "minutes": 480}],
+        },
+    }
+
+    return service.events().insert(calendarId="primary", body=event).execute()
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("你可以直接輸入行程，例如：明天下午2點看牙醫 / 明天出差")
+
+
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
+    processed = preprocess_text(text)
 
-    event = create_event(text)
+    day_word, hour, minute, task = extract_time_and_task(processed)
 
-    await update.message.reply_text(f"已建立事件：{text}")
+    try:
+        if hour == "ALL_DAY":
+            created_event = create_all_day_event(task, day_word)
+            await update.message.reply_text(
+                f"✅ 已加入 Google Calendar（全天）\n"
+                f"📌 內容：{task}\n"
+                f"🔗 事件連結：{created_event.get('htmlLink', '')}"
+            )
+            return
+
+        if day_word is not None:
+            parsed_time = build_datetime(day_word, hour, minute)
+            end_time = parsed_time + timedelta(hours=1)
+            created_event = create_calendar_event(task, parsed_time, end_time)
+            await update.message.reply_text(
+                f"✅ 已加入 Google Calendar\n"
+                f"📅 時間：{parsed_time.strftime('%Y-%m-%d %H:%M')}\n"
+                f"📌 內容：{task}\n"
+                f"🔗 事件連結：{created_event.get('htmlLink', '')}"
+            )
+            return
+
+        await update.message.reply_text("❗無法解析時間，請再試一次")
+    except Exception as e:
+        await update.message.reply_text(f"❗建立事件失敗：{e}")
 
 
 def run_bot():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(MessageHandler(filters.TEXT, handle))
-    app.run_polling()
+    telegram_app = ApplicationBuilder().token(BOT_TOKEN).build()
+    telegram_app.add_handler(CommandHandler("start", start))
+    telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
+    telegram_app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
-    threading.Thread(target=run_bot).start()
+    bot_thread = threading.Thread(target=run_bot, daemon=True)
+    bot_thread.start()
 
-    port = int(os.getenv("PORT", 10000))
+    port = int(os.getenv("PORT", "10000"))
     app_web.run(host="0.0.0.0", port=port)
