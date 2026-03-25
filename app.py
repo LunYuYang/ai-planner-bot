@@ -33,11 +33,24 @@ ALLOWED_USERS = [7243450850]
 TIMEZONE = ZoneInfo("Asia/Taipei")
 DATA_FILE = "reminders.json"
 
-MORNING_REMINDER_HOURS = [6, 8, 10]
-MORNING_END_HOUR = 11
-
 CHECK_INTERVAL_SECONDS = 20
 REMINDER_GRACE_SECONDS = 120  # 提醒容錯視窗：2分鐘內可補發
+
+PERIOD_CONFIG = {
+    "早上": {
+        "hours": [6, 8, 10],
+        "end_hour": 11,
+    },
+    "下午": {
+        "hours": [13, 15, 17],
+        "end_hour": 18,
+    },
+    "晚上": {
+        "hours": [19, 21, 23],
+        "end_hour": 23,
+        "end_minute": 59,
+    },
+}
 
 
 # =========================
@@ -88,12 +101,8 @@ def is_allowed(update: Update) -> bool:
 
 
 # =========================
-# Parsing helpers
+# Date / time helpers
 # =========================
-def tomorrow_date_str():
-    return (now_local() + timedelta(days=1)).strftime("%Y-%m-%d")
-
-
 def format_dt(dt_str: str) -> str:
     dt = datetime.fromisoformat(dt_str)
     return dt.strftime("%m/%d %H:%M")
@@ -105,7 +114,59 @@ def to_local_iso(date_str: str, hour: int, minute: int = 0) -> str:
     return dt.isoformat()
 
 
-def build_fixed_reminder(task_text: str, date_str: str, hour: int, minute: int = 0):
+def get_date_str_by_label(label: str) -> str:
+    base = now_local().date()
+
+    if label == "今天":
+        target = base
+    elif label == "明天":
+        target = base + timedelta(days=1)
+    elif label == "後天":
+        target = base + timedelta(days=2)
+    else:
+        target = base
+
+    return target.strftime("%Y-%m-%d")
+
+
+def parse_date_label(text: str):
+    for label in ["今天", "明天", "後天"]:
+        if text.startswith(label):
+            return label
+    return None
+
+
+def parse_period_label(text: str):
+    for label in ["早上", "下午", "晚上"]:
+        if text.startswith(label):
+            return label
+    return None
+
+
+def pretty_date_label(date_str: str) -> str:
+    today = now_local().date()
+    dt = datetime.strptime(date_str, "%Y-%m-%d").date()
+
+    if dt == today:
+        return "今天"
+    if dt == today + timedelta(days=1):
+        return "明天"
+    if dt == today + timedelta(days=2):
+        return "後天"
+    return dt.strftime("%m/%d")
+
+
+def period_reminder_text(period: str) -> str:
+    hours = PERIOD_CONFIG[period]["hours"]
+    return " / ".join([f"{h:02d}:00" for h in hours])
+
+
+# =========================
+# Reminder builders
+# =========================
+def build_fixed_reminder(task_text: str, date_label: str, period: str, hour: int, minute: int = 0):
+    date_str = get_date_str_by_label(date_label)
+
     target_dt = datetime.strptime(f"{date_str} {hour:02d}:{minute:02d}", "%Y-%m-%d %H:%M")
     target_dt = target_dt.replace(tzinfo=TIMEZONE)
 
@@ -120,8 +181,9 @@ def build_fixed_reminder(task_text: str, date_str: str, hour: int, minute: int =
         "user_id": ALLOWED_USERS[0],
         "kind": "fixed",
         "task_text": task_text,
+        "date_label": date_label,
         "date": date_str,
-        "period": "早上",
+        "period": period,
         "target_time": target_dt.isoformat(),
         "reminder_times": [dt.isoformat() for dt in remind_times],
         "sent_reminders": [],
@@ -130,13 +192,21 @@ def build_fixed_reminder(task_text: str, date_str: str, hour: int, minute: int =
     }
 
 
-def build_period_reminder(task_text: str, date_str: str):
+def build_period_reminder(task_text: str, date_label: str, period: str):
+    date_str = get_date_str_by_label(date_label)
+    cfg = PERIOD_CONFIG[period]
+
     remind_times = [
-        to_local_iso(date_str, 6, 0),
-        to_local_iso(date_str, 8, 0),
-        to_local_iso(date_str, 10, 0),
+        to_local_iso(date_str, hour, 0) for hour in cfg["hours"]
     ]
-    end_dt = datetime.strptime(f"{date_str} {MORNING_END_HOUR:02d}:00", "%Y-%m-%d %H:%M")
+
+    end_hour = cfg["end_hour"]
+    end_minute = cfg.get("end_minute", 0)
+
+    end_dt = datetime.strptime(
+        f"{date_str} {end_hour:02d}:{end_minute:02d}",
+        "%Y-%m-%d %H:%M"
+    )
     end_dt = end_dt.replace(tzinfo=TIMEZONE)
 
     return {
@@ -144,8 +214,9 @@ def build_period_reminder(task_text: str, date_str: str):
         "user_id": ALLOWED_USERS[0],
         "kind": "period",
         "task_text": task_text,
+        "date_label": date_label,
         "date": date_str,
-        "period": "早上",
+        "period": period,
         "target_time": None,
         "reminder_times": remind_times,
         "sent_reminders": [],
@@ -155,62 +226,84 @@ def build_period_reminder(task_text: str, date_str: str):
     }
 
 
+# =========================
+# Parsing helpers
+# =========================
 def parse_add_reminder(text: str):
     """
-    v1 only supports:
-    1) 明天早上7點吃早餐
-    2) 明天早上吃早餐
+    v2 supports:
+    1) 今天早上7點吃早餐
+    2) 明天下午3:30開會
+    3) 後天晚上洗衣服
+    4) 明天早上吃早餐
     """
     cleaned = re.sub(r"\s+", "", text)
 
-    # 固定時間：明天早上7點吃早餐 / 明天早上07點吃早餐 / 明天早上7:30吃早餐
-    m_fixed = re.match(r"^明天早上(\d{1,2})(?::|：)?(\d{0,2})點?(.*)$", cleaned)
+    date_label = parse_date_label(cleaned)
+    if not date_label:
+        return {"ok": False, "message": None}
+
+    rest = cleaned[len(date_label):]
+
+    period = parse_period_label(rest)
+    if not period:
+        return {"ok": False, "message": None}
+
+    rest = rest[len(period):]
+
+    # 固定時間：
+    # 7點吃早餐
+    # 7:30吃早餐
+    # 7：30吃早餐
+    m_fixed = re.match(r"^(\d{1,2})(?:點|(?::|：)(\d{1,2})點?)?(.*)$", rest)
     if m_fixed:
-        hour = int(m_fixed.group(1))
+        hour_str = m_fixed.group(1)
         minute_str = m_fixed.group(2)
-        minute = int(minute_str) if minute_str else 0
         task_text = m_fixed.group(3).strip()
 
-        if not task_text:
-            return {"ok": False, "message": "請補上提醒內容，例如：明天早上7點吃早餐"}
+        # 只有在後面真的有內容時，才當固定時間
+        if task_text:
+            hour = int(hour_str)
+            minute = int(minute_str) if minute_str else 0
 
-        if hour < 0 or hour > 23 or minute < 0 or minute > 59:
-            return {"ok": False, "message": "時間格式不正確"}
+            if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+                return {"ok": False, "message": "時間格式不正確"}
 
-        reminder = build_fixed_reminder(
-            task_text=task_text,
-            date_str=tomorrow_date_str(),
-            hour=hour,
-            minute=minute,
-        )
-        return {"ok": True, "reminder": reminder}
+            reminder = build_fixed_reminder(
+                task_text=task_text,
+                date_label=date_label,
+                period=period,
+                hour=hour,
+                minute=minute,
+            )
+            return {"ok": True, "reminder": reminder}
 
-    # 時段型：明天早上吃早餐
-    m_period = re.match(r"^明天早上(.*)$", cleaned)
-    if m_period:
-        task_text = m_period.group(1).strip()
-
-        if not task_text:
-            return {"ok": False, "message": "請補上提醒內容，例如：明天早上吃早餐"}
-
+    # 時段型：今天早上吃早餐
+    task_text = rest.strip()
+    if task_text:
         reminder = build_period_reminder(
             task_text=task_text,
-            date_str=tomorrow_date_str(),
+            date_label=date_label,
+            period=period,
         )
         return {"ok": True, "reminder": reminder}
 
-    return {"ok": False, "message": None}
+    return {"ok": False, "message": "請補上提醒內容，例如：明天早上7點吃早餐"}
 
 
 def parse_cancel_keyword(text: str):
-    # 支援：取消 明天早餐 / 取消明天早餐 / 取消 早餐
     cleaned = re.sub(r"\s+", "", text)
     if not cleaned.startswith("取消"):
         return None
 
     body = cleaned[2:]
-    date_filter = "tomorrow" if "明天" in body else None
-    body = body.replace("明天", "")
+    date_filter = None
+    for label in ["今天", "明天", "後天"]:
+        if label in body:
+            date_filter = label
+            body = body.replace(label, "")
+            break
+
     keyword = body.strip()
 
     return {
@@ -220,14 +313,18 @@ def parse_cancel_keyword(text: str):
 
 
 def parse_complete_keyword(text: str):
-    # 支援：完成 早餐 / 完成明天早餐
     cleaned = re.sub(r"\s+", "", text)
     if not cleaned.startswith("完成"):
         return None
 
     body = cleaned[2:]
-    date_filter = "tomorrow" if "明天" in body else None
-    body = body.replace("明天", "")
+    date_filter = None
+    for label in ["今天", "明天", "後天"]:
+        if label in body:
+            date_filter = label
+            body = body.replace(label, "")
+            break
+
     keyword = body.strip()
 
     return {
@@ -237,9 +334,9 @@ def parse_complete_keyword(text: str):
 
 
 def is_same_target_date(reminder, date_filter):
-    if date_filter == "tomorrow":
-        return reminder.get("date") == tomorrow_date_str()
-    return True
+    if not date_filter:
+        return True
+    return reminder.get("date") == get_date_str_by_label(date_filter)
 
 
 def match_keyword(reminder, keyword):
@@ -253,17 +350,16 @@ def format_reminder_line(r):
         target = format_dt(r["target_time"])
         return f"- [{r['id']}] 固定時間｜{target}｜{r['task_text']}｜{r['status']}"
     else:
-        return f"- [{r['id']}] 早上時段｜{r['date']} 06:00/08:00/10:00｜{r['task_text']}｜{r['status']}"
+        return (
+            f"- [{r['id']}] {r['date_label']}{r['period']}｜"
+            f"{period_reminder_text(r['period'])}｜{r['task_text']}｜{r['status']}"
+        )
 
 
 # =========================
 # Reminder business logic
 # =========================
 def should_send_now(now_dt: datetime, remind_dt: datetime, grace_seconds: int = REMINDER_GRACE_SECONDS) -> bool:
-    """
-    在提醒時間點之後的一小段容錯時間內都允許補發。
-    例如提醒時間 06:00，若 06:01:20 才檢查到，仍可發送。
-    """
     diff = (now_dt - remind_dt).total_seconds()
     return 0 <= diff <= grace_seconds
 
@@ -314,7 +410,6 @@ def check_and_send_due_reminders():
         if r["status"] != "active":
             continue
 
-        # 先檢查是否過期
         if r["kind"] == "fixed":
             target_dt = datetime.fromisoformat(r["target_time"])
             if now_dt > target_dt:
@@ -329,7 +424,6 @@ def check_and_send_due_reminders():
                 changed = True
                 continue
 
-        # 再檢查提醒是否該發送（含補發容錯）
         for rt in r["reminder_times"]:
             if rt in r["sent_reminders"]:
                 continue
@@ -359,8 +453,8 @@ def check_and_send_due_reminders():
                     )
                 else:
                     msg = (
-                        f"【提醒】早上要 {r['task_text']}\n"
-                        f"提醒時段：06:00 / 08:00 / 10:00\n"
+                        f"【提醒】{r['date_label']}{r['period']}要 {r['task_text']}\n"
+                        f"提醒時段：{period_reminder_text(r['period'])}\n"
                         f"回覆「完成 {r['task_text']}」可停止後續提醒"
                     )
 
@@ -394,11 +488,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Bot is alive!\n"
         "目前支援：\n"
-        "1. 明天早上7點吃早餐\n"
-        "2. 明天早上吃早餐\n"
-        "3. 取消 明天早餐\n"
-        "4. 完成 早餐\n"
-        "5. 我的提醒"
+        "1. 今天早上7點吃早餐\n"
+        "2. 明天下午3:30開會\n"
+        "3. 後天晚上洗衣服\n"
+        "4. 明天早上吃早餐\n"
+        "5. 取消 明天早餐\n"
+        "6. 完成 早餐\n"
+        "7. 我的提醒"
     )
 
 
@@ -421,14 +517,21 @@ async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(
-        "提醒功能 v1 用法：\n\n"
+        "提醒功能 v2 用法：\n\n"
         "【新增】\n"
-        "- 明天早上7點吃早餐\n"
+        "- 今天早上7點吃早餐\n"
+        "- 明天下午3:30開會\n"
+        "- 後天晚上洗衣服\n"
         "- 明天早上吃早餐\n\n"
         "【查看】\n"
-        "- 我的提醒\n\n"
+        "- 我的提醒\n"
+        "- 查看提醒\n"
+        "- 今天有什麼\n"
+        "- 明天有什麼\n"
+        "- 後天有什麼\n\n"
         "【取消】\n"
         "- 取消 明天早餐\n"
+        "- 取消 今天洗衣服\n"
         "- 取消 早餐\n\n"
         "【完成】\n"
         "- 完成 早餐\n"
@@ -454,6 +557,26 @@ async def list_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+async def list_reminders_by_date(update: Update, date_label: str):
+    reminders = load_reminders()
+    target_date = get_date_str_by_label(date_label)
+
+    active = [
+        r for r in reminders
+        if r["status"] == "active" and r.get("date") == target_date
+    ]
+
+    if not active:
+        await update.message.reply_text(f"{date_label}沒有進行中的提醒。")
+        return
+
+    lines = [f"{date_label}的提醒："]
+    for r in active:
+        lines.append(format_reminder_line(r))
+
+    await update.message.reply_text("\n".join(lines))
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
@@ -464,8 +587,20 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
 
     # 1) 查看提醒
-    if text in ["我的提醒", "查看提醒", "明天有什麼"]:
+    if text in ["我的提醒", "查看提醒"]:
         await list_reminders(update, context)
+        return
+
+    if text in ["今天有什麼", "今天提醒"]:
+        await list_reminders_by_date(update, "今天")
+        return
+
+    if text in ["明天有什麼", "明天提醒"]:
+        await list_reminders_by_date(update, "明天")
+        return
+
+    if text in ["後天有什麼", "後天提醒"]:
+        await list_reminders_by_date(update, "後天")
         return
 
     # 2) 取消提醒
@@ -533,8 +668,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             await update.message.reply_text(
-                f"已建立提醒：明天早上 {reminder['task_text']}\n"
-                f"提醒時間：06:00、08:00、10:00\n"
+                f"已建立提醒：{reminder['date_label']}{reminder['period']} {reminder['task_text']}\n"
+                f"提醒時間：{period_reminder_text(reminder['period'])}\n"
                 f"完成後可輸入：完成 {reminder['task_text']}"
             )
         return
@@ -543,7 +678,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "目前看不懂這句。\n"
         "你可以試試：\n"
-        "- 明天早上7點吃早餐\n"
+        "- 今天早上7點吃早餐\n"
+        "- 明天下午3:30開會\n"
+        "- 後天晚上洗衣服\n"
         "- 明天早上吃早餐\n"
         "- 我的提醒\n"
         "- 取消 明天早餐\n"
@@ -565,15 +702,12 @@ if __name__ == "__main__":
 
     ensure_data_file()
 
-    # Flask thread
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
 
-    # Reminder background thread
     scheduler_thread = threading.Thread(target=reminder_scheduler_loop, daemon=True)
     scheduler_thread.start()
 
-    # Telegram bot
     application = ApplicationBuilder().token(BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start))
