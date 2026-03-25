@@ -34,7 +34,10 @@ TIMEZONE = ZoneInfo("Asia/Taipei")
 DATA_FILE = "reminders.json"
 
 MORNING_REMINDER_HOURS = [6, 8, 10]
-MORNING_END_HOUR = 11  # 超過 11:00 視為早上時段結束
+MORNING_END_HOUR = 11
+
+CHECK_INTERVAL_SECONDS = 20
+REMINDER_GRACE_SECONDS = 120  # 提醒容錯視窗：2分鐘內可補發
 
 
 # =========================
@@ -158,7 +161,6 @@ def parse_add_reminder(text: str):
     1) 明天早上7點吃早餐
     2) 明天早上吃早餐
     """
-
     cleaned = re.sub(r"\s+", "", text)
 
     # 固定時間：明天早上7點吃早餐 / 明天早上07點吃早餐 / 明天早上7:30吃早餐
@@ -257,6 +259,15 @@ def format_reminder_line(r):
 # =========================
 # Reminder business logic
 # =========================
+def should_send_now(now_dt: datetime, remind_dt: datetime, grace_seconds: int = REMINDER_GRACE_SECONDS) -> bool:
+    """
+    在提醒時間點之後的一小段容錯時間內都允許補發。
+    例如提醒時間 06:00，若 06:01:20 才檢查到，仍可發送。
+    """
+    diff = (now_dt - remind_dt).total_seconds()
+    return 0 <= diff <= grace_seconds
+
+
 def expire_old_reminders():
     reminders = load_reminders()
     now_dt = now_local()
@@ -303,7 +314,7 @@ def check_and_send_due_reminders():
         if r["status"] != "active":
             continue
 
-        # 先處理過期
+        # 先檢查是否過期
         if r["kind"] == "fixed":
             target_dt = datetime.fromisoformat(r["target_time"])
             if now_dt > target_dt:
@@ -318,15 +329,17 @@ def check_and_send_due_reminders():
                 changed = True
                 continue
 
-        # 檢查該不該發提醒
+        # 再檢查提醒是否該發送（含補發容錯）
         for rt in r["reminder_times"]:
             if rt in r["sent_reminders"]:
                 continue
 
             remind_dt = datetime.fromisoformat(rt)
 
-            # v1: 每 20 秒檢查一次，只要現在時間 >= 提醒時間 就發
-            if now_dt >= remind_dt:
+            if not should_send_now(now_dt, remind_dt):
+                continue
+
+            try:
                 if r["kind"] == "fixed":
                     target = datetime.fromisoformat(r["target_time"])
                     delta_min = int((target - remind_dt).total_seconds() / 60)
@@ -355,6 +368,9 @@ def check_and_send_due_reminders():
                 r["sent_reminders"].append(rt)
                 changed = True
 
+            except Exception as e:
+                print(f"[check_and_send_due_reminders] send error: {e}")
+
     if changed:
         update_reminders(reminders)
 
@@ -366,7 +382,7 @@ def reminder_scheduler_loop():
             check_and_send_due_reminders()
         except Exception as e:
             print(f"[reminder_scheduler_loop] error: {e}")
-        time.sleep(20)
+        time.sleep(CHECK_INTERVAL_SECONDS)
 
 
 # =========================
