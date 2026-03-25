@@ -1,7 +1,9 @@
-python-telegram-bot==20.7
+python-telegram-bot[job-queue]==21.6
+Flask==3.0.3
+openai>=1.0.0
+
 python-dotenv
 google-api-python-client
 google-auth
 google-auth-oauthlib
 google-auth-httplib2
-Flask
