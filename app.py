@@ -1,718 +1,618 @@
 import os
-import re
 import json
-import time
-import uuid
-import asyncio
+import logging
+import sqlite3
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from flask import Flask
-from telegram import Update, Bot
+from openai import OpenAI
+from telegram import Update
 from telegram.ext import (
-    ApplicationBuilder,
+    Application,
     CommandHandler,
-    MessageHandler,
     ContextTypes,
+    MessageHandler,
     filters,
 )
 
-app = Flask(__name__)
+# =========================
+# 基本設定
+# =========================
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
 
-@app.route("/")
-def home():
-    return "Bot is running!"
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "").strip()
+TZ_NAME = os.getenv("TZ", "Asia/Taipei")
+PORT = int(os.getenv("PORT", "10000"))
+DB_PATH = os.getenv("DB_PATH", "reminders.db")
+
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN 未設定")
+if not OWNER_ID:
+    raise ValueError("OWNER_ID 未設定")
+if not OPENAI_API_KEY:
+    raise ValueError("OPENAI_API_KEY 未設定")
+if not OPENAI_MODEL:
+    raise ValueError("OPENAI_MODEL 未設定")
+
+tz = ZoneInfo(TZ_NAME)
+client = OpenAI(api_key=OPENAI_API_KEY)
+flask_app = Flask(__name__)
 
 
 # =========================
-# Basic config
+# Flask 健康檢查
 # =========================
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ALLOWED_USERS = [7243450850]
-TIMEZONE = ZoneInfo("Asia/Taipei")
-DATA_FILE = "reminders.json"
+@flask_app.route("/")
+def healthcheck():
+    return "Bot is running v3.2", 200
 
-CHECK_INTERVAL_SECONDS = 20
-REMINDER_GRACE_SECONDS = 120  # 提醒容錯視窗：2分鐘內可補發
 
-PERIOD_CONFIG = {
-    "早上": {
-        "hours": [6, 8, 10],
-        "end_hour": 11,
+def run_web_server():
+    flask_app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
+
+
+# =========================
+# 資料庫
+# =========================
+def get_conn():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS reminders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            schedule_type TEXT NOT NULL,         -- single / daily
+            remind_at TEXT,                      -- single 用 ISO datetime
+            time_local TEXT,                     -- daily 用 HH:MM
+            message TEXT NOT NULL,
+            sent INTEGER NOT NULL DEFAULT 0,     -- single 用
+            last_sent_date TEXT,                 -- daily 用 YYYY-MM-DD
+            created_at TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def add_single_reminder(chat_id: int, remind_at_iso: str, message: str) -> int:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO reminders (
+            chat_id, schedule_type, remind_at, time_local, message,
+            sent, last_sent_date, created_at
+        ) VALUES (?, 'single', ?, NULL, ?, 0, NULL, ?)
+    """, (chat_id, remind_at_iso, message, now_local_iso()))
+    conn.commit()
+    reminder_id = cur.lastrowid
+    conn.close()
+    return reminder_id
+
+
+def add_daily_reminder(chat_id: int, time_local: str, message: str) -> int:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO reminders (
+            chat_id, schedule_type, remind_at, time_local, message,
+            sent, last_sent_date, created_at
+        ) VALUES (?, 'daily', NULL, ?, ?, 0, NULL, ?)
+    """, (chat_id, time_local, message, now_local_iso()))
+    conn.commit()
+    reminder_id = cur.lastrowid
+    conn.close()
+    return reminder_id
+
+
+def list_reminders(chat_id: int):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, schedule_type, remind_at, time_local, message, sent, last_sent_date
+        FROM reminders
+        WHERE chat_id = ?
+        ORDER BY
+            CASE WHEN schedule_type = 'single' THEN 0 ELSE 1 END,
+            remind_at ASC,
+            time_local ASC
+    """, (chat_id,))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def delete_reminder(chat_id: int, reminder_id: int) -> bool:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        DELETE FROM reminders
+        WHERE id = ? AND chat_id = ?
+    """, (reminder_id, chat_id))
+    affected = cur.rowcount
+    conn.commit()
+    conn.close()
+    return affected > 0
+
+
+def get_due_single_reminders():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, chat_id, remind_at, message
+        FROM reminders
+        WHERE schedule_type = 'single'
+          AND sent = 0
+    """)
+    rows = cur.fetchall()
+    conn.close()
+
+    due = []
+    now_dt = now_local_dt()
+    for row in rows:
+        try:
+            remind_dt = datetime.fromisoformat(row["remind_at"]).astimezone(tz)
+            if remind_dt <= now_dt:
+                due.append(row)
+        except Exception:
+            logger.exception("single reminder parse error: id=%s", row["id"])
+    return due
+
+
+def get_due_daily_reminders():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, chat_id, time_local, message, last_sent_date
+        FROM reminders
+        WHERE schedule_type = 'daily'
+    """)
+    rows = cur.fetchall()
+    conn.close()
+
+    due = []
+    now_dt = now_local_dt()
+    today = now_dt.strftime("%Y-%m-%d")
+    current_hm = now_dt.strftime("%H:%M")
+
+    for row in rows:
+        try:
+            target_hm = row["time_local"]
+            if current_hm >= target_hm and row["last_sent_date"] != today:
+                due.append(row)
+        except Exception:
+            logger.exception("daily reminder parse error: id=%s", row["id"])
+    return due
+
+
+def mark_single_sent(reminder_id: int):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE reminders
+        SET sent = 1
+        WHERE id = ?
+    """, (reminder_id,))
+    conn.commit()
+    conn.close()
+
+
+def mark_daily_sent_today(reminder_id: int):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE reminders
+        SET last_sent_date = ?
+        WHERE id = ?
+    """, (today_local_str(), reminder_id))
+    conn.commit()
+    conn.close()
+
+
+# =========================
+# 時間工具
+# =========================
+def now_local_dt() -> datetime:
+    return datetime.now(tz)
+
+
+def now_local_iso() -> str:
+    return now_local_dt().isoformat()
+
+
+def today_local_str() -> str:
+    return now_local_dt().strftime("%Y-%m-%d")
+
+
+# =========================
+# 權限
+# =========================
+def is_owner(update: Update) -> bool:
+    user = update.effective_user
+    return user is not None and user.id == OWNER_ID
+
+
+async def owner_only(update: Update) -> bool:
+    if not is_owner(update):
+        if update.message:
+            await update.message.reply_text("此 bot 為私人使用。")
+        return False
+    return True
+
+
+# =========================
+# OpenAI 解析
+# =========================
+REMINDER_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "intent": {
+            "type": "string",
+            "enum": ["create_reminder", "unsupported"]
+        },
+        "schedule_type": {
+            "type": ["string", "null"],
+            "enum": ["single", "daily", None]
+        },
+        "datetime_local": {
+            "type": ["string", "null"],
+            "description": "單次提醒時間，格式必須是 YYYY-MM-DD HH:MM，使用 Asia/Taipei"
+        },
+        "time_local": {
+            "type": ["string", "null"],
+            "description": "每日提醒時間，格式必須是 HH:MM，使用 Asia/Taipei"
+        },
+        "message": {
+            "type": ["string", "null"]
+        },
+        "confidence": {
+            "type": "number"
+        },
+        "reason": {
+            "type": "string"
+        }
     },
-    "下午": {
-        "hours": [13, 15, 17],
-        "end_hour": 18,
-    },
-    "晚上": {
-        "hours": [19, 21, 23],
-        "end_hour": 23,
-        "end_minute": 59,
-    },
+    "required": [
+        "intent",
+        "schedule_type",
+        "datetime_local",
+        "time_local",
+        "message",
+        "confidence",
+        "reason"
+    ]
 }
 
 
-# =========================
-# Storage helpers
-# =========================
-data_lock = threading.Lock()
+def parse_user_text_with_ai(user_text: str) -> dict:
+    now_str = now_local_dt().strftime("%Y-%m-%d %H:%M")
+    developer_prompt = f"""
+你是一個提醒解析器，只能輸出符合 JSON schema 的資料，不要輸出其他文字。
 
+目前時區：Asia/Taipei
+目前本地時間：{now_str}
 
-def now_local() -> datetime:
-    return datetime.now(TIMEZONE)
+任務：
+把使用者輸入解析成提醒資料。
 
+規則：
+1. 若明確是建立提醒，intent = "create_reminder"
+2. 若不是提醒、資訊不足、時間太模糊，intent = "unsupported"
+3. schedule_type 只能是 "single" 或 "daily" 或 null
+4. 若是單次提醒，datetime_local 要填 YYYY-MM-DD HH:MM，time_local = null
+5. 若是每日提醒，time_local 要填 HH:MM，datetime_local = null
+6. message 要保留提醒重點，例如「吃早餐」「記帳」
+7. 若使用者寫「提醒我」但沒給可執行時間，請標為 unsupported
+8. 「明天早上八點提醒我吃早餐」=> single
+9. 「每天晚上十點提醒我記帳」=> daily
+10. confidence 範圍 0 到 1
+11. reason 用一句簡短中文說明你的判斷
+""".strip()
 
-def ensure_data_file():
-    if not os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump([], f, ensure_ascii=False, indent=2)
-
-
-def load_reminders():
-    ensure_data_file()
-    with data_lock:
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-
-
-def save_reminders(reminders):
-    with data_lock:
-        with open(DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump(reminders, f, ensure_ascii=False, indent=2)
-
-
-def add_reminder(reminder):
-    reminders = load_reminders()
-    reminders.append(reminder)
-    save_reminders(reminders)
-
-
-def update_reminders(reminders):
-    save_reminders(reminders)
-
-
-# =========================
-# Authorization
-# =========================
-def is_allowed(update: Update) -> bool:
-    user = update.effective_user
-    return bool(user and user.id in ALLOWED_USERS)
-
-
-# =========================
-# Date / time helpers
-# =========================
-def format_dt(dt_str: str) -> str:
-    dt = datetime.fromisoformat(dt_str)
-    return dt.strftime("%m/%d %H:%M")
-
-
-def to_local_iso(date_str: str, hour: int, minute: int = 0) -> str:
-    dt = datetime.strptime(f"{date_str} {hour:02d}:{minute:02d}", "%Y-%m-%d %H:%M")
-    dt = dt.replace(tzinfo=TIMEZONE)
-    return dt.isoformat()
-
-
-def get_date_str_by_label(label: str) -> str:
-    base = now_local().date()
-
-    if label == "今天":
-        target = base
-    elif label == "明天":
-        target = base + timedelta(days=1)
-    elif label == "後天":
-        target = base + timedelta(days=2)
-    else:
-        target = base
-
-    return target.strftime("%Y-%m-%d")
-
-
-def parse_date_label(text: str):
-    for label in ["今天", "明天", "後天"]:
-        if text.startswith(label):
-            return label
-    return None
-
-
-def parse_period_label(text: str):
-    for label in ["早上", "下午", "晚上"]:
-        if text.startswith(label):
-            return label
-    return None
-
-
-def pretty_date_label(date_str: str) -> str:
-    today = now_local().date()
-    dt = datetime.strptime(date_str, "%Y-%m-%d").date()
-
-    if dt == today:
-        return "今天"
-    if dt == today + timedelta(days=1):
-        return "明天"
-    if dt == today + timedelta(days=2):
-        return "後天"
-    return dt.strftime("%m/%d")
-
-
-def period_reminder_text(period: str) -> str:
-    hours = PERIOD_CONFIG[period]["hours"]
-    return " / ".join([f"{h:02d}:00" for h in hours])
-
-
-# =========================
-# Reminder builders
-# =========================
-def build_fixed_reminder(task_text: str, date_label: str, period: str, hour: int, minute: int = 0):
-    date_str = get_date_str_by_label(date_label)
-
-    target_dt = datetime.strptime(f"{date_str} {hour:02d}:{minute:02d}", "%Y-%m-%d %H:%M")
-    target_dt = target_dt.replace(tzinfo=TIMEZONE)
-
-    remind_times = [
-        target_dt - timedelta(hours=2),
-        target_dt - timedelta(hours=1),
-        target_dt - timedelta(minutes=30),
-    ]
-
-    return {
-        "id": str(uuid.uuid4())[:8],
-        "user_id": ALLOWED_USERS[0],
-        "kind": "fixed",
-        "task_text": task_text,
-        "date_label": date_label,
-        "date": date_str,
-        "period": period,
-        "target_time": target_dt.isoformat(),
-        "reminder_times": [dt.isoformat() for dt in remind_times],
-        "sent_reminders": [],
-        "status": "active",  # active/completed/cancelled/expired
-        "created_at": now_local().isoformat(),
-    }
-
-
-def build_period_reminder(task_text: str, date_label: str, period: str):
-    date_str = get_date_str_by_label(date_label)
-    cfg = PERIOD_CONFIG[period]
-
-    remind_times = [
-        to_local_iso(date_str, hour, 0) for hour in cfg["hours"]
-    ]
-
-    end_hour = cfg["end_hour"]
-    end_minute = cfg.get("end_minute", 0)
-
-    end_dt = datetime.strptime(
-        f"{date_str} {end_hour:02d}:{end_minute:02d}",
-        "%Y-%m-%d %H:%M"
+    response = client.responses.create(
+        model=OPENAI_MODEL,
+        input=[
+            {"role": "developer", "content": developer_prompt},
+            {"role": "user", "content": user_text},
+        ],
+        text={
+            "format": {
+                "type": "json_schema",
+                "name": "reminder_parse",
+                "schema": REMINDER_SCHEMA,
+                "strict": True,
+            }
+        },
     )
-    end_dt = end_dt.replace(tzinfo=TIMEZONE)
 
-    return {
-        "id": str(uuid.uuid4())[:8],
-        "user_id": ALLOWED_USERS[0],
-        "kind": "period",
-        "task_text": task_text,
-        "date_label": date_label,
-        "date": date_str,
-        "period": period,
-        "target_time": None,
-        "reminder_times": remind_times,
-        "sent_reminders": [],
-        "status": "active",
-        "created_at": now_local().isoformat(),
-        "period_end": end_dt.isoformat(),
-    }
+    raw = response.output_text
+    data = json.loads(raw)
+    return data
 
 
-# =========================
-# Parsing helpers
-# =========================
-def parse_add_reminder(text: str):
-    """
-    v2 supports:
-    1) 今天早上7點吃早餐
-    2) 明天下午3:30開會
-    3) 後天晚上洗衣服
-    4) 明天早上吃早餐
-    """
-    cleaned = re.sub(r"\s+", "", text)
+def validate_ai_result(data: dict) -> tuple[bool, str, dict | None]:
+    intent = data.get("intent")
+    schedule_type = data.get("schedule_type")
+    dt_str = data.get("datetime_local")
+    time_local = data.get("time_local")
+    message = (data.get("message") or "").strip()
 
-    date_label = parse_date_label(cleaned)
-    if not date_label:
-        return {"ok": False, "message": None}
+    if intent != "create_reminder":
+        return False, "我目前只會建立提醒，例如：明天早上8點提醒我吃早餐", None
 
-    rest = cleaned[len(date_label):]
+    if schedule_type not in ("single", "daily"):
+        return False, "提醒類型判斷失敗。", None
 
-    period = parse_period_label(rest)
-    if not period:
-        return {"ok": False, "message": None}
+    if not message:
+        return False, "提醒內容判斷失敗。", None
 
-    rest = rest[len(period):]
-
-    # 固定時間：
-    # 7點吃早餐
-    # 7:30吃早餐
-    # 7：30吃早餐
-    m_fixed = re.match(r"^(\d{1,2})(?:點|(?::|：)(\d{1,2})點?)?(.*)$", rest)
-    if m_fixed:
-        hour_str = m_fixed.group(1)
-        minute_str = m_fixed.group(2)
-        task_text = m_fixed.group(3).strip()
-
-        # 只有在後面真的有內容時，才當固定時間
-        if task_text:
-            hour = int(hour_str)
-            minute = int(minute_str) if minute_str else 0
-
-            if hour < 0 or hour > 23 or minute < 0 or minute > 59:
-                return {"ok": False, "message": "時間格式不正確"}
-
-            reminder = build_fixed_reminder(
-                task_text=task_text,
-                date_label=date_label,
-                period=period,
-                hour=hour,
-                minute=minute,
-            )
-            return {"ok": True, "reminder": reminder}
-
-    # 時段型：今天早上吃早餐
-    task_text = rest.strip()
-    if task_text:
-        reminder = build_period_reminder(
-            task_text=task_text,
-            date_label=date_label,
-            period=period,
-        )
-        return {"ok": True, "reminder": reminder}
-
-    return {"ok": False, "message": "請補上提醒內容，例如：明天早上7點吃早餐"}
-
-
-def parse_cancel_keyword(text: str):
-    cleaned = re.sub(r"\s+", "", text)
-    if not cleaned.startswith("取消"):
-        return None
-
-    body = cleaned[2:]
-    date_filter = None
-    for label in ["今天", "明天", "後天"]:
-        if label in body:
-            date_filter = label
-            body = body.replace(label, "")
-            break
-
-    keyword = body.strip()
-
-    return {
-        "date_filter": date_filter,
-        "keyword": keyword,
-    }
-
-
-def parse_complete_keyword(text: str):
-    cleaned = re.sub(r"\s+", "", text)
-    if not cleaned.startswith("完成"):
-        return None
-
-    body = cleaned[2:]
-    date_filter = None
-    for label in ["今天", "明天", "後天"]:
-        if label in body:
-            date_filter = label
-            body = body.replace(label, "")
-            break
-
-    keyword = body.strip()
-
-    return {
-        "date_filter": date_filter,
-        "keyword": keyword,
-    }
-
-
-def is_same_target_date(reminder, date_filter):
-    if not date_filter:
-        return True
-    return reminder.get("date") == get_date_str_by_label(date_filter)
-
-
-def match_keyword(reminder, keyword):
-    if not keyword:
-        return True
-    return keyword in reminder.get("task_text", "")
-
-
-def format_reminder_line(r):
-    if r["kind"] == "fixed":
-        target = format_dt(r["target_time"])
-        return f"- [{r['id']}] 固定時間｜{target}｜{r['task_text']}｜{r['status']}"
-    else:
-        return (
-            f"- [{r['id']}] {r['date_label']}{r['period']}｜"
-            f"{period_reminder_text(r['period'])}｜{r['task_text']}｜{r['status']}"
-        )
-
-
-# =========================
-# Reminder business logic
-# =========================
-def should_send_now(now_dt: datetime, remind_dt: datetime, grace_seconds: int = REMINDER_GRACE_SECONDS) -> bool:
-    diff = (now_dt - remind_dt).total_seconds()
-    return 0 <= diff <= grace_seconds
-
-
-def expire_old_reminders():
-    reminders = load_reminders()
-    now_dt = now_local()
-    changed = False
-
-    for r in reminders:
-        if r["status"] != "active":
-            continue
-
-        if r["kind"] == "fixed":
-            target_dt = datetime.fromisoformat(r["target_time"])
-            if now_dt > target_dt:
-                r["status"] = "expired"
-                changed = True
-
-        elif r["kind"] == "period":
-            period_end = datetime.fromisoformat(r["period_end"])
-            if now_dt > period_end:
-                r["status"] = "expired"
-                changed = True
-
-    if changed:
-        update_reminders(reminders)
-
-
-async def send_telegram_message(user_id: int, text: str):
-    bot = Bot(token=BOT_TOKEN)
-    await bot.send_message(chat_id=user_id, text=text)
-
-
-def send_message_sync(user_id: int, text: str):
-    try:
-        asyncio.run(send_telegram_message(user_id, text))
-    except Exception as e:
-        print(f"[send_message_sync] error: {e}")
-
-
-def check_and_send_due_reminders():
-    reminders = load_reminders()
-    now_dt = now_local()
-    changed = False
-
-    for r in reminders:
-        if r["status"] != "active":
-            continue
-
-        if r["kind"] == "fixed":
-            target_dt = datetime.fromisoformat(r["target_time"])
-            if now_dt > target_dt:
-                r["status"] = "expired"
-                changed = True
-                continue
-
-        elif r["kind"] == "period":
-            period_end = datetime.fromisoformat(r["period_end"])
-            if now_dt > period_end:
-                r["status"] = "expired"
-                changed = True
-                continue
-
-        for rt in r["reminder_times"]:
-            if rt in r["sent_reminders"]:
-                continue
-
-            remind_dt = datetime.fromisoformat(rt)
-
-            if not should_send_now(now_dt, remind_dt):
-                continue
-
-            try:
-                if r["kind"] == "fixed":
-                    target = datetime.fromisoformat(r["target_time"])
-                    delta_min = int((target - remind_dt).total_seconds() / 60)
-
-                    if delta_min == 120:
-                        lead_text = "2 小時後"
-                    elif delta_min == 60:
-                        lead_text = "1 小時後"
-                    elif delta_min == 30:
-                        lead_text = "30 分鐘後"
-                    else:
-                        lead_text = "稍後"
-
-                    msg = (
-                        f"【提醒】{lead_text}要 {r['task_text']}\n"
-                        f"時間：{target.strftime('%m/%d %H:%M')}"
-                    )
-                else:
-                    msg = (
-                        f"【提醒】{r['date_label']}{r['period']}要 {r['task_text']}\n"
-                        f"提醒時段：{period_reminder_text(r['period'])}\n"
-                        f"回覆「完成 {r['task_text']}」可停止後續提醒"
-                    )
-
-                send_message_sync(r["user_id"], msg)
-                r["sent_reminders"].append(rt)
-                changed = True
-
-            except Exception as e:
-                print(f"[check_and_send_due_reminders] send error: {e}")
-
-    if changed:
-        update_reminders(reminders)
-
-
-def reminder_scheduler_loop():
-    while True:
+    if schedule_type == "single":
+        if not dt_str:
+            return False, "缺少單次提醒時間。", None
         try:
-            expire_old_reminders()
-            check_and_send_due_reminders()
-        except Exception as e:
-            print(f"[reminder_scheduler_loop] error: {e}")
-        time.sleep(CHECK_INTERVAL_SECONDS)
+            remind_dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M").replace(tzinfo=tz)
+        except ValueError:
+            return False, "時間格式錯誤，AI 沒有成功解析。", None
+
+        if remind_dt <= now_local_dt():
+            return False, "提醒時間必須晚於現在。", None
+
+        return True, "", {
+            "schedule_type": "single",
+            "remind_at_iso": remind_dt.isoformat(),
+            "display_time": remind_dt.strftime("%Y-%m-%d %H:%M"),
+            "message": message,
+        }
+
+    if schedule_type == "daily":
+        if not time_local:
+            return False, "缺少每日提醒時間。", None
+        try:
+            datetime.strptime(time_local, "%H:%M")
+        except ValueError:
+            return False, "每日提醒時間格式錯誤。", None
+
+        return True, "", {
+            "schedule_type": "daily",
+            "time_local": time_local,
+            "message": message,
+        }
+
+    return False, "未知錯誤。", None
 
 
 # =========================
-# Telegram handlers
+# 指令
 # =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update):
+    if not await owner_only(update):
+        return
+
+    text = (
+        "✅ AI 提醒 bot 已啟動（v3.2）\n\n"
+        "你可以直接傳：\n"
+        "明天早上8點提醒我吃早餐\n"
+        "今天晚上10點提醒我記帳\n"
+        "每天早上7點提醒我吃藥\n\n"
+        "其他指令：\n"
+        "/list 查看提醒\n"
+        "/delete 編號 刪除提醒\n"
+        "/ping 測試 bot\n"
+        "/now 顯示目前時間"
+    )
+    await update.message.reply_text(text)
+
+
+async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await owner_only(update):
+        return
+    await update.message.reply_text("pong ✅")
+
+
+async def now_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await owner_only(update):
         return
     await update.message.reply_text(
-        "Bot is alive!\n"
-        "目前支援：\n"
-        "1. 今天早上7點吃早餐\n"
-        "2. 明天下午3:30開會\n"
-        "3. 後天晚上洗衣服\n"
-        "4. 明天早上吃早餐\n"
-        "5. 取消 明天早餐\n"
-        "6. 完成 早餐\n"
-        "7. 我的提醒"
+        f"目前時間：{now_local_dt().strftime('%Y-%m-%d %H:%M:%S')} ({TZ_NAME})"
     )
 
 
-async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update):
+async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await owner_only(update):
         return
 
-    user = update.effective_user
-    username = f"@{user.username}" if user.username else "No username set"
-
-    await update.message.reply_text(
-        f"Your user ID: {user.id}\n"
-        f"Username: {username}\n"
-        f"Name: {user.first_name}"
-    )
-
-
-async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update):
+    rows = list_reminders(update.effective_chat.id)
+    if not rows:
+        await update.message.reply_text("目前沒有提醒。")
         return
 
-    await update.message.reply_text(
-        "提醒功能 v2 用法：\n\n"
-        "【新增】\n"
-        "- 今天早上7點吃早餐\n"
-        "- 明天下午3:30開會\n"
-        "- 後天晚上洗衣服\n"
-        "- 明天早上吃早餐\n\n"
-        "【查看】\n"
-        "- 我的提醒\n"
-        "- 查看提醒\n"
-        "- 今天有什麼\n"
-        "- 明天有什麼\n"
-        "- 後天有什麼\n\n"
-        "【取消】\n"
-        "- 取消 明天早餐\n"
-        "- 取消 今天洗衣服\n"
-        "- 取消 早餐\n\n"
-        "【完成】\n"
-        "- 完成 早餐\n"
-        "- 完成 明天早餐"
-    )
-
-
-async def list_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update):
-        return
-
-    reminders = load_reminders()
-    active = [r for r in reminders if r["status"] == "active"]
-
-    if not active:
-        await update.message.reply_text("目前沒有進行中的提醒。")
-        return
-
-    lines = ["目前進行中的提醒："]
-    for r in active:
-        lines.append(format_reminder_line(r))
+    lines = ["📋 提醒清單"]
+    for row in rows:
+        if row["schedule_type"] == "single":
+            dt = datetime.fromisoformat(row["remind_at"]).astimezone(tz)
+            status = "✅ 已送出" if row["sent"] else "⏳ 待提醒"
+            lines.append(
+                f'{row["id"]}. [單次] {dt.strftime("%Y-%m-%d %H:%M")} | {row["message"]} | {status}'
+            )
+        else:
+            last_sent = row["last_sent_date"] or "尚未送出"
+            lines.append(
+                f'{row["id"]}. [每日] {row["time_local"]} | {row["message"]} | 上次送出：{last_sent}'
+            )
 
     await update.message.reply_text("\n".join(lines))
 
 
-async def list_reminders_by_date(update: Update, date_label: str):
-    reminders = load_reminders()
-    target_date = get_date_str_by_label(date_label)
-
-    active = [
-        r for r in reminders
-        if r["status"] == "active" and r.get("date") == target_date
-    ]
-
-    if not active:
-        await update.message.reply_text(f"{date_label}沒有進行中的提醒。")
+async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await owner_only(update):
         return
 
-    lines = [f"{date_label}的提醒："]
-    for r in active:
-        lines.append(format_reminder_line(r))
+    if not context.args:
+        await update.message.reply_text("請用：/delete 編號")
+        return
 
-    await update.message.reply_text("\n".join(lines))
+    try:
+        reminder_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("提醒編號必須是數字。")
+        return
+
+    ok = delete_reminder(update.effective_chat.id, reminder_id)
+    if ok:
+        await update.message.reply_text(f"✅ 已刪除提醒 {reminder_id}")
+    else:
+        await update.message.reply_text("找不到這個提醒編號。")
 
 
+# =========================
+# 一般文字：交給 AI 解析
+# =========================
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update):
+    if not await owner_only(update):
         return
 
-    if not update.message or not update.message.text:
+    user_text = (update.message.text or "").strip()
+    if not user_text:
         return
 
-    text = update.message.text.strip()
+    try:
+        ai_result = parse_user_text_with_ai(user_text)
+        ok, err, normalized = validate_ai_result(ai_result)
 
-    # 1) 查看提醒
-    if text in ["我的提醒", "查看提醒"]:
-        await list_reminders(update, context)
-        return
+        if not ok:
+            await update.message.reply_text(err)
+            return
 
-    if text in ["今天有什麼", "今天提醒"]:
-        await list_reminders_by_date(update, "今天")
-        return
-
-    if text in ["明天有什麼", "明天提醒"]:
-        await list_reminders_by_date(update, "明天")
-        return
-
-    if text in ["後天有什麼", "後天提醒"]:
-        await list_reminders_by_date(update, "後天")
-        return
-
-    # 2) 取消提醒
-    cancel_info = parse_cancel_keyword(text)
-    if cancel_info is not None:
-        reminders = load_reminders()
-        count = 0
-
-        for r in reminders:
-            if r["status"] != "active":
-                continue
-            if not is_same_target_date(r, cancel_info["date_filter"]):
-                continue
-            if not match_keyword(r, cancel_info["keyword"]):
-                continue
-
-            r["status"] = "cancelled"
-            count += 1
-
-        update_reminders(reminders)
-
-        if count == 0:
-            await update.message.reply_text("找不到符合的提醒。")
-        else:
-            await update.message.reply_text(f"已取消 {count} 筆提醒。")
-        return
-
-    # 3) 完成提醒
-    complete_info = parse_complete_keyword(text)
-    if complete_info is not None:
-        reminders = load_reminders()
-        count = 0
-
-        for r in reminders:
-            if r["status"] != "active":
-                continue
-            if not is_same_target_date(r, complete_info["date_filter"]):
-                continue
-            if not match_keyword(r, complete_info["keyword"]):
-                continue
-
-            r["status"] = "completed"
-            count += 1
-
-        update_reminders(reminders)
-
-        if count == 0:
-            await update.message.reply_text("找不到符合的提醒可完成。")
-        else:
-            await update.message.reply_text(f"已完成 {count} 筆提醒，後續將不再提醒。")
-        return
-
-    # 4) 新增提醒
-    parsed = parse_add_reminder(text)
-    if parsed["ok"]:
-        reminder = parsed["reminder"]
-        add_reminder(reminder)
-
-        if reminder["kind"] == "fixed":
-            target = datetime.fromisoformat(reminder["target_time"]).strftime("%m/%d %H:%M")
-            reminder_times = [datetime.fromisoformat(x).strftime("%H:%M") for x in reminder["reminder_times"]]
-            await update.message.reply_text(
-                f"已建立提醒：{target} {reminder['task_text']}\n"
-                f"提醒時間：{'、'.join(reminder_times)}"
+        if normalized["schedule_type"] == "single":
+            reminder_id = add_single_reminder(
+                chat_id=update.effective_chat.id,
+                remind_at_iso=normalized["remind_at_iso"],
+                message=normalized["message"],
             )
-        else:
             await update.message.reply_text(
-                f"已建立提醒：{reminder['date_label']}{reminder['period']} {reminder['task_text']}\n"
-                f"提醒時間：{period_reminder_text(reminder['period'])}\n"
-                f"完成後可輸入：完成 {reminder['task_text']}"
+                "✅ 已建立單次提醒\n"
+                f"編號：{reminder_id}\n"
+                f"時間：{normalized['display_time']}\n"
+                f"內容：{normalized['message']}"
             )
-        return
+            return
 
-    # 5) 其他
-    await update.message.reply_text(
-        "目前看不懂這句。\n"
-        "你可以試試：\n"
-        "- 今天早上7點吃早餐\n"
-        "- 明天下午3:30開會\n"
-        "- 後天晚上洗衣服\n"
-        "- 明天早上吃早餐\n"
-        "- 我的提醒\n"
-        "- 取消 明天早餐\n"
-        "- 完成 早餐"
+        if normalized["schedule_type"] == "daily":
+            reminder_id = add_daily_reminder(
+                chat_id=update.effective_chat.id,
+                time_local=normalized["time_local"],
+                message=normalized["message"],
+            )
+            await update.message.reply_text(
+                "✅ 已建立每日提醒\n"
+                f"編號：{reminder_id}\n"
+                f"每天：{normalized['time_local']}\n"
+                f"內容：{normalized['message']}"
+            )
+            return
+
+        await update.message.reply_text("解析成功，但建立提醒失敗。")
+
+    except Exception as e:
+        logger.exception("handle_text error: %s", e)
+        await update.message.reply_text("建立提醒失敗，請稍後再試。")
+
+
+# =========================
+# 背景工作：送提醒
+# =========================
+async def reminder_worker(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        # 單次提醒
+        single_rows = get_due_single_reminders()
+        for row in single_rows:
+            try:
+                dt = datetime.fromisoformat(row["remind_at"]).astimezone(tz)
+                text = (
+                    "⏰ 提醒時間到！\n"
+                    f'時間：{dt.strftime("%Y-%m-%d %H:%M")}\n'
+                    f'內容：{row["message"]}'
+                )
+                await context.bot.send_message(chat_id=row["chat_id"], text=text)
+                mark_single_sent(row["id"])
+            except Exception:
+                logger.exception("send single reminder failed: id=%s", row["id"])
+
+        # 每日提醒
+        daily_rows = get_due_daily_reminders()
+        for row in daily_rows:
+            try:
+                text = (
+                    "⏰ 每日提醒\n"
+                    f'時間：{row["time_local"]}\n'
+                    f'內容：{row["message"]}'
+                )
+                await context.bot.send_message(chat_id=row["chat_id"], text=text)
+                mark_daily_sent_today(row["id"])
+            except Exception:
+                logger.exception("send daily reminder failed: id=%s", row["id"])
+
+    except Exception as e:
+        logger.exception("reminder_worker error: %s", e)
+
+
+async def post_init(application: Application):
+    application.job_queue.run_repeating(
+        reminder_worker,
+        interval=30,
+        first=10,
+        name="reminder_worker",
+    )
+    logger.info("reminder_worker started")
+
+
+# =========================
+# 主程式
+# =========================
+def build_application() -> Application:
+    application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("ping", ping))
+    application.add_handler(CommandHandler("now", now_command))
+    application.add_handler(CommandHandler("list", list_command))
+    application.add_handler(CommandHandler("delete", delete_command))
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)
     )
 
+    return application
 
-# =========================
-# Flask + Main
-# =========================
-def run_flask():
-    port = int(os.environ.get("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port)
+
+def main():
+    init_db()
+
+    web_thread = threading.Thread(target=run_web_server, daemon=True)
+    web_thread.start()
+
+    application = build_application()
+    application.run_polling(
+        poll_interval=1.5,
+        timeout=20,
+        drop_pending_updates=False,
+        allowed_updates=Update.ALL_TYPES,
+    )
 
 
 if __name__ == "__main__":
-    if not BOT_TOKEN:
-        raise ValueError("BOT_TOKEN is missing")
-
-    ensure_data_file()
-
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-
-    scheduler_thread = threading.Thread(target=reminder_scheduler_loop, daemon=True)
-    scheduler_thread.start()
-
-    application = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("whoami", whoami))
-    application.add_handler(CommandHandler("help", show_help))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-
-    application.run_polling()
+    main()
