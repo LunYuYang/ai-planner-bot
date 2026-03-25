@@ -11,19 +11,15 @@ def home():
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-
 async def start(update, context):
     await update.message.reply_text("Bot is alive!")
-
 
 async def echo(update, context):
     await update.message.reply_text(update.message.text)
 
-
 def run_flask():
-    port = int(os.environ.get("PORT", 10000))
+    port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
-
 
 if __name__ == "__main__":
     if not BOT_TOKEN:
@@ -37,4 +33,4 @@ if __name__ == "__main__":
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
 
     print("Telegram bot started")
-    application.run_polling(drop_pending_updates=True)
+    application.run_polling()
