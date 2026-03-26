@@ -682,7 +682,6 @@ def save_event_with_notifications(chat_id: int, event_time: datetime, message: s
         for notify_type, label, delta in ADVANCE_REMINDER_RULES:
             notify_time = event_time - delta if delta.total_seconds() > 0 else event_time
 
-            # 已經過去的提前提醒不建立，避免剛建立就瞬間連發
             if notify_time <= datetime.now(TZINFO) and notify_type != "event":
                 continue
 
@@ -1055,7 +1054,6 @@ def handle_cancel(chat_id: int, text: str) -> None:
         send_message(chat_id, f"找不到可取消的事件代碼 #{event_id}")
         return
 
-    # scheduler 清掉 job
     pending = get_pending_notifications()
     for row in pending:
         if int(row["event_id"]) == event_id:
