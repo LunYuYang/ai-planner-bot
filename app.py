@@ -83,7 +83,9 @@ RSS_FEEDS = {
 # DB
 # =========================
 def get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    from db import get_conn
+
+conn = get_conn()
     conn.row_factory = sqlite3.Row
     return conn
 
