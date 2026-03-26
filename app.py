@@ -609,23 +609,31 @@ def parse_absolute_reminder(text: str) -> Optional[Dict[str, Any]]:
             return None
         return {"event_time": dt, "message": msg.strip()}
 
-    # 格式：
+    # 支援：
     # 今天晚上8點打球
+    # 今天晚上7點半打球
+    # 今天下午4:30開會
+    # 今天下午4點30分開會
     # 明天早上8點提醒我開會
-    # 今天下午4:30 開會
-    # 今天下午4點30分 開會
     m = re.match(
-        r"^\s*(今天|明天)\s*(早上|上午|中午|下午|晚上)?\s*(\d{1,2})(?:(?:\s*[:：]\s*(\d{1,2}))|(?:\s*點\s*(\d{1,2})?))?\s*(?:分)?\s*(提醒我)?\s*(.+?)\s*$",
+        r"^\s*(今天|明天)\s*"
+        r"(早上|上午|中午|下午|晚上)?\s*"
+        r"(\d{1,2})"
+        r"(?:(?:\s*[:：]\s*(\d{1,2}))|(?:\s*點\s*(半|(\d{1,2}))?))?"
+        r"\s*(?:分)?\s*"
+        r"(提醒我)?\s*(.+?)\s*$",
         raw
     )
     if m:
-        day_word, period, hour_str, minute_str_colon, minute_str_dot, _, msg = m.groups()
+        day_word, period, hour_str, minute_str_colon, half_flag, minute_str_dot, _, msg = m.groups()
         base_date = now.date() if day_word == "今天" else (now + timedelta(days=1)).date()
 
         hour = int(hour_str)
 
         if minute_str_colon is not None:
             minute = int(minute_str_colon)
+        elif half_flag == "半":
+            minute = 30
         elif minute_str_dot is not None:
             minute = int(minute_str_dot)
         else:
