@@ -198,14 +198,7 @@ def telegram_api(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     return data
 
 
-def send_message(chat_id: int, text: str, disable_web_page_preview: bool = True) -> None:
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": disable_web_page_preview,
-    }
-    telegram_api("sendMessage", payload)
+
 
 
 def set_webhook() -> None:
