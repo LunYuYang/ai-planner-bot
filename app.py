@@ -599,7 +599,7 @@ def parse_absolute_reminder(text: str) -> Optional[Dict[str, Any]]:
     raw = text.strip()
     now = datetime.now(TZINFO)
 
-    # 1️⃣ 完整日期（優先）
+    # 1️⃣ 完整日期
     m = re.match(r"^\s*(\d{4}-\d{2}-\d{2})\s+(\d{1,2}):(\d{2})\s+(.+?)\s*$", raw)
     if m:
         date_str, hour_str, minute_str, msg = m.groups()
@@ -609,7 +609,7 @@ def parse_absolute_reminder(text: str) -> Optional[Dict[str, Any]]:
             return None
         return {"event_time": dt, "message": msg.strip()}
 
-    # 2️⃣ 中文時間（核心）
+    # 2️⃣ 中文時間
     m = re.match(
         r"^\s*(今天|明天|昨天)?\s*"
         r"(早上|上午|中午|下午|晚上)?\s*"
@@ -622,17 +622,15 @@ def parse_absolute_reminder(text: str) -> Optional[Dict[str, Any]]:
     if m:
         day_word, period, hour_str, minute_str_colon, half_flag, minute_str_dot, _, msg = m.groups()
 
-        # ✅ 日期邏輯（關鍵）
         if day_word == "明天":
             base_date = (now + timedelta(days=1)).date()
         elif day_word == "昨天":
-            return None  # ❗直接不接受過去時間
+            return None
         else:
             base_date = now.date()
 
         hour = int(hour_str)
 
-        # 分鐘處理
         if minute_str_colon is not None:
             minute = int(minute_str_colon)
         elif half_flag == "半":
@@ -642,7 +640,6 @@ def parse_absolute_reminder(text: str) -> Optional[Dict[str, Any]]:
         else:
             minute = 0
 
-        # 上午下午轉換
         if period in ("下午", "晚上") and hour < 12:
             hour += 12
         elif period == "中午":
@@ -663,7 +660,6 @@ def parse_absolute_reminder(text: str) -> Optional[Dict[str, Any]]:
         except ValueError:
             return None
 
-        # ❗避免設定到過去（例如今天已過）
         if dt <= now:
             return None
 
@@ -847,9 +843,7 @@ def notification_job_id(notification_id: int) -> str:
 def build_notification_text(label: str, event_time: datetime, message: str, event_id: int) -> str:
     return (
         "⏰ <b>提醒通知</b>\n"
-        f"事件代碼：<b>{event_id}</b>\n"
-        f"事件：{html.escape(event_time.strftime('%Y-%m-%d %H:%M'))}｜{html.escape(message)}\n"
-        f"提醒時間：{html.escape(label)}"
+        f"{html.escape(event_time.strftime('%Y-%m-%d %H:%M'))}｜{html.escape(message)}"
     )
 
 
@@ -974,7 +968,7 @@ def handle_start(chat_id: int) -> None:
     register_chat_id(chat_id)
 
     msg = (
-        "<b>✅ v3.6 詳細提醒版已啟用</b>\n\n"
+        "<b>✅ Bot 已啟用</b>\n\n"
         "可用功能：\n"
         "/news\n"
         "/news tech\n"
@@ -983,16 +977,10 @@ def handle_start(chat_id: int) -> None:
         "/cancel 事件代碼\n"
         "/help\n\n"
         "提醒可直接輸入：\n"
-        "今天晚上8點打球\n"
-        "明天下午4點製sem樣品\n"
+        "晚上7點半打球\n"
+        "明天晚上7點半打球\n"
         "2026-03-27 14:30 開會\n"
-        "30分鐘後提醒我喝水\n\n"
-        "建立事件後會自動加入：\n"
-        "- 2小時前\n"
-        "- 1小時前\n"
-        "- 30分鐘前\n"
-        "- 事件時間\n\n"
-        "也支援直接輸入：取消sem"
+        "30分鐘後提醒我喝水"
     )
     send_message(chat_id, msg)
 
@@ -1008,12 +996,12 @@ def handle_help(chat_id: int) -> None:
         "/list\n"
         "/cancel 事件代碼\n\n"
         "提醒輸入範例：\n"
-        "今天晚上8點打球\n"
-        "明天下午4點製sem樣品\n"
+        "晚上7點半打球\n"
+        "明天晚上7點半打球\n"
         "30分鐘後提醒我喝水\n\n"
         "取消範例：\n"
         "/cancel 12\n"
-        "取消sem"
+        "取消打球"
     )
     send_message(chat_id, msg)
 
@@ -1046,9 +1034,7 @@ def handle_list(chat_id: int) -> None:
 
         lines.append(
             f"事件代碼：<b>{row['id']}</b>\n"
-            f"時間：{html.escape(event_time.strftime('%Y-%m-%d %H:%M'))}\n"
-            f"內容：{html.escape(row['message'])}\n"
-            f"關鍵字：{html.escape(row['keyword'])}"
+            f"{html.escape(event_time.strftime('%Y-%m-%d %H:%M'))}｜{html.escape(row['message'])}"
         )
         lines.append("")
 
@@ -1077,7 +1063,7 @@ def handle_cancel(chat_id: int, text: str) -> None:
             except Exception as e:
                 logger.exception("remove job failed: %s", e)
 
-    send_message(chat_id, f"✅ 已取消事件提醒 #{event_id}")
+    send_message(chat_id, "✅ 已取消提醒")
 
 
 def handle_cancel_by_keyword(chat_id: int, text: str) -> bool:
@@ -1115,8 +1101,8 @@ def handle_cancel_by_keyword(chat_id: int, text: str) -> bool:
                 logger.exception("remove job failed: %s", e)
 
     msg = (
-        f"✅ 已取消 1 組事件提醒：\n"
-        f"- {html.escape(event_time.strftime('%Y-%m-%d %H:%M'))}｜{html.escape(row['message'])}"
+        "✅ 已取消提醒\n"
+        f"{html.escape(event_time.strftime('%Y-%m-%d %H:%M'))}｜{html.escape(row['message'])}"
     )
     send_message(chat_id, msg)
     return True
@@ -1133,10 +1119,10 @@ def handle_unknown(chat_id: int) -> None:
         "/list\n"
         "/cancel 事件代碼\n\n"
         "也可以直接輸入提醒，例如：\n"
-        "今天晚上8點打球\n"
-        "明天下午4點製sem樣品\n\n"
+        "晚上7點半打球\n"
+        "明天晚上7點半打球\n\n"
         "取消也可直接輸入：\n"
-        "取消sem"
+        "取消打球"
     )
     send_message(chat_id, msg)
 
@@ -1163,14 +1149,9 @@ def try_handle_event_reminder(chat_id: int, text: str) -> bool:
         )
 
     lines = [
-        "✅ 已建立整組提醒",
-        f"事件代碼：{result['event_id']}",
-        f"事件：{html.escape(event_time.strftime('%Y-%m-%d %H:%M'))}｜{html.escape(message)}",
-        "提醒時間：",
+        "✅ 已建立提醒",
+        f"{html.escape(event_time.strftime('%Y-%m-%d %H:%M'))}｜{html.escape(message)}",
     ]
-
-    for n in result["notifications"]:
-        lines.append(f"{n['label']}：{html.escape(n['notify_time'].strftime('%Y-%m-%d %H:%M'))}")
 
     send_message(chat_id, "\n".join(lines))
     return True
@@ -1214,7 +1195,7 @@ def home():
     return jsonify(
         {
             "ok": True,
-            "service": "telegram-bot-private-news-reminder-v3_6-detailed",
+            "service": "telegram-bot-private-news-reminder-v3_6",
             "timezone": TIMEZONE,
             "news_push_time": NEWS_PUSH_TIME,
             "owner_id_set": bool(OWNER_ID),
@@ -1266,8 +1247,8 @@ def telegram_webhook():
                 return jsonify({"ok": True})
 
             handled = try_handle_event_reminder(chat_id, text)
-if not handled:
-    send_message(chat_id, "⚠️ 時間已過或格式錯誤，請重新輸入")
+            if not handled:
+                send_message(chat_id, "⚠️ 時間已過或格式錯誤，請重新輸入")
 
         return jsonify({"ok": True})
 
