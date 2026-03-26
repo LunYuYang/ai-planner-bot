@@ -494,14 +494,122 @@ ADVANCE_REMINDER_RULES = [
     ("event", "- 事件時間", timedelta(seconds=0)),
 ]
 
+CHINESE_NUMBER_MAP = {
+    "零": 0,
+    "〇": 0,
+    "○": 0,
+    "Ｏ": 0,
+    "一": 1,
+    "二": 2,
+    "兩": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
+}
+
 
 def normalize_keyword_for_event(message: str) -> str:
     text = re.sub(r"\s+", "", message.strip().lower())
     return text[:30] if text else "event"
 
 
+def normalize_message_for_compare(message: str) -> str:
+    text = message.strip().lower()
+    text = re.sub(r"\s+", "", text)
+    text = re.sub(r"[，。,\.！!？?、~～\-—_]+", "", text)
+    return text
+
+
+def chinese_numeral_to_int(text: str) -> Optional[int]:
+    s = text.strip()
+    if not s:
+        return None
+
+    if s.isdigit():
+        return int(s)
+
+    if s == "十":
+        return 10
+
+    if "十" in s:
+        parts = s.split("十")
+        if len(parts) != 2:
+            return None
+
+        left, right = parts
+        tens = 1 if left == "" else CHINESE_NUMBER_MAP.get(left)
+        if tens is None:
+            return None
+
+        if right == "":
+            ones = 0
+        else:
+            ones = CHINESE_NUMBER_MAP.get(right)
+            if ones is None:
+                return None
+
+        return tens * 10 + ones
+
+    value = 0
+    for ch in s:
+        if ch not in CHINESE_NUMBER_MAP:
+            return None
+        value = value * 10 + CHINESE_NUMBER_MAP[ch]
+
+    return value
+
+
+def replace_chinese_number_in_match(match: re.Match) -> str:
+    value = chinese_numeral_to_int(match.group(1))
+    if value is None:
+        return match.group(0)
+    return str(value)
+
+
+def normalize_chinese_time_text(text: str) -> str:
+    normalized = text.strip()
+
+    # 相對時間：三十分鐘後 / 兩小時後
+    normalized = re.sub(
+        r"([零〇○Ｏ一二兩三四五六七八九十\d]+)(?=\s*(分鐘|分|min|mins|minute|minutes|小時|hr|hrs|hour|hours)\s*後)",
+        replace_chinese_number_in_match,
+        normalized,
+        flags=re.IGNORECASE,
+    )
+
+    # 日期格式中的月日國字，像 3月二十七日 這種先不處理，避免過度影響其他內容
+    # 主要處理提醒時常見的 時 / 分
+
+    # 七點 / 十點 / 十二點
+    normalized = re.sub(
+        r"([零〇○Ｏ一二兩三四五六七八九十\d]+)(?=\s*點)",
+        replace_chinese_number_in_match,
+        normalized,
+    )
+
+    # 十分 / 二十五分
+    normalized = re.sub(
+        r"([零〇○Ｏ一二兩三四五六七八九十\d]+)(?=\s*分)",
+        replace_chinese_number_in_match,
+        normalized,
+    )
+
+    # 7:三十 / 7：三十
+    normalized = re.sub(
+        r"(?<=[:：])\s*([零〇○Ｏ一二兩三四五六七八九十\d]+)",
+        replace_chinese_number_in_match,
+        normalized,
+    )
+
+    return normalized
+
+
 def parse_relative_reminder(text: str) -> Optional[Dict[str, Any]]:
-    raw = text.strip()
+    raw = normalize_chinese_time_text(text.strip())
     now = datetime.now(TZINFO)
 
     m = re.match(
@@ -527,7 +635,7 @@ def parse_relative_reminder(text: str) -> Optional[Dict[str, Any]]:
 
 
 def parse_absolute_reminder(text: str) -> Optional[Dict[str, Any]]:
-    raw = text.strip()
+    raw = normalize_chinese_time_text(text.strip())
     now = datetime.now(TZINFO)
 
     m = re.match(r"^\s*(\d{4}-\d{2}-\d{2})\s+(\d{1,2}):(\d{2})\s+(.+?)\s*$", raw)
@@ -599,6 +707,47 @@ def parse_absolute_reminder(text: str) -> Optional[Dict[str, Any]]:
 
 def parse_chinese_reminder(text: str) -> Optional[Dict[str, Any]]:
     return parse_relative_reminder(text) or parse_absolute_reminder(text)
+
+
+def get_notification_ids_by_event(event_id: int) -> List[int]:
+    conn = get_conn()
+    try:
+        cur = conn.execute(
+            """
+            SELECT id
+            FROM reminder_notifications
+            WHERE event_id = ? AND sent = 0 AND canceled = 0
+            """,
+            (event_id,)
+        )
+        return [int(row["id"]) for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def find_duplicate_event(chat_id: int, event_time: datetime, message: str) -> Optional[sqlite3.Row]:
+    conn = get_conn()
+    try:
+        cur = conn.execute(
+            """
+            SELECT id, event_time, message, keyword
+            FROM reminder_events
+            WHERE chat_id = ?
+              AND event_time = ?
+              AND canceled = 0
+            ORDER BY id DESC
+            """,
+            (chat_id, event_time.isoformat())
+        )
+        rows = cur.fetchall()
+
+        target_message = normalize_message_for_compare(message)
+        for row in rows:
+            if normalize_message_for_compare(row["message"]) == target_message:
+                return row
+        return None
+    finally:
+        conn.close()
 
 
 def save_event_with_notifications(chat_id: int, event_time: datetime, message: str) -> Dict[str, Any]:
@@ -819,6 +968,17 @@ def schedule_one_notification(
         logger.exception("Failed to schedule notification id=%s: %s", notification_id, e)
 
 
+def remove_scheduled_jobs_for_event(event_id: int) -> None:
+    notification_ids = get_notification_ids_by_event(event_id)
+    for notification_id in notification_ids:
+        try:
+            scheduler.remove_job(notification_job_id(notification_id))
+        except JobLookupError:
+            pass
+        except Exception as e:
+            logger.exception("Failed removing notification job id=%s: %s", notification_id, e)
+
+
 def load_pending_notifications_into_scheduler() -> None:
     rows = get_pending_notifications()
     now = datetime.now(TZINFO)
@@ -907,9 +1067,11 @@ def handle_start(chat_id: int) -> None:
         "/help\n\n"
         "提醒可直接輸入：\n"
         "晚上7點半打球\n"
-        "明天晚上7點半打球\n"
+        "今天早上七點吃肉粿\n"
+        "明天晚上七點半打球\n"
         "2026-03-27 14:30 開會\n"
-        "30分鐘後提醒我喝水"
+        "30分鐘後提醒我喝水\n"
+        "兩小時後提醒我洗衣服"
     )
     send_message(chat_id, msg)
 
@@ -926,8 +1088,10 @@ def handle_help(chat_id: int) -> None:
         "/cancel 事件代碼\n\n"
         "提醒輸入範例：\n"
         "晚上7點半打球\n"
-        "明天晚上7點半打球\n"
-        "30分鐘後提醒我喝水\n\n"
+        "今天早上七點吃肉粿\n"
+        "明天晚上七點半打球\n"
+        "30分鐘後提醒我喝水\n"
+        "兩小時後提醒我洗衣服\n\n"
         "取消範例：\n"
         "/cancel 12\n"
         "取消打球"
@@ -982,16 +1146,7 @@ def handle_cancel(chat_id: int, text: str) -> None:
         send_message(chat_id, f"找不到可取消的事件代碼 #{event_id}")
         return
 
-    pending = get_pending_notifications()
-    for row in pending:
-        if int(row["event_id"]) == event_id:
-            try:
-                scheduler.remove_job(notification_job_id(int(row["id"])))
-            except JobLookupError:
-                pass
-            except Exception as e:
-                logger.exception("remove job failed: %s", e)
-
+    remove_scheduled_jobs_for_event(event_id)
     send_message(chat_id, "✅ 已取消提醒")
 
 
@@ -1019,15 +1174,7 @@ def handle_cancel_by_keyword(chat_id: int, text: str) -> bool:
         send_message(chat_id, "取消失敗，請稍後再試。")
         return True
 
-    pending = get_pending_notifications()
-    for n in pending:
-        if int(n["event_id"]) == event_id:
-            try:
-                scheduler.remove_job(notification_job_id(int(n["id"])))
-            except JobLookupError:
-                pass
-            except Exception as e:
-                logger.exception("remove job failed: %s", e)
+    remove_scheduled_jobs_for_event(event_id)
 
     msg = (
         "✅ 已取消提醒\n"
@@ -1045,6 +1192,14 @@ def try_handle_event_reminder(chat_id: int, text: str) -> bool:
     event_time: datetime = parsed["event_time"]
     message: str = parsed["message"]
 
+    replaced = False
+    duplicate = find_duplicate_event(chat_id, event_time, message)
+    if duplicate:
+        old_event_id = int(duplicate["id"])
+        if cancel_event_by_id(old_event_id, chat_id):
+            remove_scheduled_jobs_for_event(old_event_id)
+            replaced = True
+
     result = save_event_with_notifications(chat_id, event_time, message)
 
     for n in result["notifications"]:
@@ -1059,9 +1214,13 @@ def try_handle_event_reminder(chat_id: int, text: str) -> bool:
         )
 
     lines = [
-        "✅ 已建立提醒",
-        f"{event_time.strftime('%Y-%m-%d %H:%M')}｜{message}",
+        "✅ 已更新提醒" if replaced else "✅ 已建立提醒",
     ]
+
+    if replaced:
+        lines.append("已覆蓋先前相同提醒")
+
+    lines.append(f"{event_time.strftime('%Y-%m-%d %H:%M')}｜{message}")
 
     send_message(chat_id, "\n".join(lines))
     return True
@@ -1079,7 +1238,9 @@ def handle_unknown(chat_id: int) -> None:
         "/cancel 事件代碼\n\n"
         "也可以直接輸入提醒，例如：\n"
         "晚上7點半打球\n"
-        "明天晚上7點半打球\n\n"
+        "今天早上七點吃肉粿\n"
+        "明天晚上七點半打球\n"
+        "兩小時後提醒我喝水\n\n"
         "取消也可直接輸入：\n"
         "取消打球"
     )
