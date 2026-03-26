@@ -1266,8 +1266,8 @@ def telegram_webhook():
                 return jsonify({"ok": True})
 
             handled = try_handle_event_reminder(chat_id, text)
-            if not handled:
-                handle_unknown(chat_id)
+if not handled:
+    send_message(chat_id, "⚠️ 時間已過或格式錯誤，請重新輸入")
 
         return jsonify({"ok": True})
 
