@@ -599,7 +599,7 @@ def parse_absolute_reminder(text: str) -> Optional[Dict[str, Any]]:
     raw = text.strip()
     now = datetime.now(TZINFO)
 
-    # 格式：2026-03-27 14:30 開會
+    # 1️⃣ 完整日期（優先）
     m = re.match(r"^\s*(\d{4}-\d{2}-\d{2})\s+(\d{1,2}):(\d{2})\s+(.+?)\s*$", raw)
     if m:
         date_str, hour_str, minute_str, msg = m.groups()
@@ -609,14 +609,9 @@ def parse_absolute_reminder(text: str) -> Optional[Dict[str, Any]]:
             return None
         return {"event_time": dt, "message": msg.strip()}
 
-    # 支援：
-    # 今天晚上8點打球
-    # 今天晚上7點半打球
-    # 今天下午4:30開會
-    # 今天下午4點30分開會
-    # 明天早上8點提醒我開會
+    # 2️⃣ 中文時間（核心）
     m = re.match(
-        r"^\s*(今天|明天)\s*"
+        r"^\s*(今天|明天|昨天)?\s*"
         r"(早上|上午|中午|下午|晚上)?\s*"
         r"(\d{1,2})"
         r"(?:(?:\s*[:：]\s*(\d{1,2}))|(?:\s*點\s*(半|(\d{1,2}))?))?"
@@ -626,10 +621,18 @@ def parse_absolute_reminder(text: str) -> Optional[Dict[str, Any]]:
     )
     if m:
         day_word, period, hour_str, minute_str_colon, half_flag, minute_str_dot, _, msg = m.groups()
-        base_date = now.date() if day_word == "今天" else (now + timedelta(days=1)).date()
+
+        # ✅ 日期邏輯（關鍵）
+        if day_word == "明天":
+            base_date = (now + timedelta(days=1)).date()
+        elif day_word == "昨天":
+            return None  # ❗直接不接受過去時間
+        else:
+            base_date = now.date()
 
         hour = int(hour_str)
 
+        # 分鐘處理
         if minute_str_colon is not None:
             minute = int(minute_str_colon)
         elif half_flag == "半":
@@ -639,6 +642,7 @@ def parse_absolute_reminder(text: str) -> Optional[Dict[str, Any]]:
         else:
             minute = 0
 
+        # 上午下午轉換
         if period in ("下午", "晚上") and hour < 12:
             hour += 12
         elif period == "中午":
@@ -659,6 +663,7 @@ def parse_absolute_reminder(text: str) -> Optional[Dict[str, Any]]:
         except ValueError:
             return None
 
+        # ❗避免設定到過去（例如今天已過）
         if dt <= now:
             return None
 
