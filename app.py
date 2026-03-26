@@ -12,6 +12,7 @@ from bs4 import BeautifulSoup
 from flask import Flask, request, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
 from zoneinfo import ZoneInfo
+from openai import OpenAI
 
 
 # =========================
@@ -20,25 +21,22 @@ from zoneinfo import ZoneInfo
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 WEBHOOK_SECRET_PATH = os.getenv("WEBHOOK_SECRET_PATH", "telegram").strip()
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
-TIMEZONE = os.getenv("TIMEZONE", "Asia/Taipei").strip()
+TIMEZONE = os.getenv("TIMEZONE", os.getenv("TZ", "Asia/Taipei")).strip()
 
-# 每日推播時間，例如 08:00
 NEWS_PUSH_TIME = os.getenv("NEWS_PUSH_TIME", "08:00").strip()
-
-# 每次推播幾則
 DEFAULT_NEWS_LIMIT = int(os.getenv("DEFAULT_NEWS_LIMIT", "5"))
-
-# 預設分類：all / tech / business
 DEFAULT_NEWS_CATEGORY = os.getenv("DEFAULT_NEWS_CATEGORY", "all").strip().lower()
 
-# 若你想固定只推送給某個 chat_id，可填；不填就自動記錄互動過的 chat_id
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-
-# 存資料目錄
 DATA_DIR = os.getenv("DATA_DIR", "data")
 CHAT_FILE = os.path.join(DATA_DIR, "chat_ids.json")
 
-HTTP_TIMEOUT = 15
+HTTP_TIMEOUT = 20
+
+# OpenAI
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
+ENABLE_CHINESE_SUMMARY = os.getenv("ENABLE_CHINESE_SUMMARY", "true").strip().lower() == "true"
 
 if not BOT_TOKEN:
     raise RuntimeError("Missing BOT_TOKEN in environment variables.")
@@ -53,6 +51,8 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 scheduler = BackgroundScheduler(timezone=ZoneInfo(TIMEZONE))
+
+client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 
 # =========================
@@ -154,7 +154,7 @@ def set_webhook() -> None:
 
 
 # =========================
-# 新聞處理
+# 文字工具
 # =========================
 def clean_html_text(raw: str) -> str:
     if not raw:
@@ -206,7 +206,7 @@ def extract_source_name(feed_title: str, entry: Dict[str, Any]) -> str:
     return source_name
 
 
-def build_summary(entry: Dict[str, Any], source_name: str) -> str:
+def build_raw_summary(entry: Dict[str, Any], source_name: str) -> str:
     candidates = [
         entry.get("summary", ""),
         entry.get("description", ""),
@@ -216,11 +216,83 @@ def build_summary(entry: Dict[str, Any], source_name: str) -> str:
         cleaned = clean_html_text(raw)
         title_clean = clean_html_text(entry.get("title", ""))
         if cleaned and cleaned != title_clean:
-            return trim_text(cleaned, 110)
+            return trim_text(cleaned, 220)
 
-    return f"來自 {source_name} 的最新報導，點擊連結查看完整內容。"
+    return f"Latest report from {source_name}. Open the link for full details."
 
 
+# =========================
+# OpenAI 中文摘要
+# =========================
+def summarize_to_chinese(title: str, raw_summary: str, source_name: str) -> str:
+    """
+    將英文標題/摘要轉成繁體中文短摘要。
+    失敗時回傳原始摘要的簡短版。
+    """
+    fallback = trim_text(raw_summary, 110)
+
+    if not ENABLE_CHINESE_SUMMARY:
+        return fallback
+
+    if not client:
+        logger.warning("OPENAI_API_KEY not set, fallback to raw summary.")
+        return fallback
+
+    try:
+        prompt = f"""
+請將以下科技或商業新聞整理成繁體中文摘要。
+
+要求：
+1. 使用繁體中文
+2. 30~60字左右
+3. 精簡、自然、像新聞快報
+4. 不要加入未提供的推測
+5. 優先保留公司、產品、商業/科技重點
+6. 只輸出摘要，不要加「摘要：」
+
+新聞標題：
+{title}
+
+新聞內容：
+{raw_summary}
+
+新聞來源：
+{source_name}
+""".strip()
+
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "你是擅長整理國際科技與商業新聞的繁體中文編輯，輸出精簡、清楚、自然。"
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                },
+            ],
+            temperature=0.3,
+            max_tokens=120,
+        )
+
+        content = (resp.choices[0].message.content or "").strip()
+        content = re.sub(r"^摘要[:：]\s*", "", content)
+        content = re.sub(r"\s+", " ", content).strip()
+
+        if not content:
+            return fallback
+
+        return trim_text(content, 110)
+
+    except Exception as e:
+        logger.exception("Chinese summary failed: %s", e)
+        return fallback
+
+
+# =========================
+# 新聞抓取
+# =========================
 def fetch_rss_items(feed_url: str, category: str) -> List[Dict[str, Any]]:
     parsed = feedparser.parse(feed_url)
     feed_title = clean_html_text(parsed.feed.get("title", ""))
@@ -234,7 +306,8 @@ def fetch_rss_items(feed_url: str, category: str) -> List[Dict[str, Any]]:
 
         link = entry.get("link", "").strip()
         source_name = extract_source_name(feed_title, entry)
-        summary = build_summary(entry, source_name)
+        raw_summary = build_raw_summary(entry, source_name)
+        zh_summary = summarize_to_chinese(title_raw, raw_summary, source_name)
         published_ts = parse_published_ts(entry)
 
         items.append(
@@ -242,7 +315,8 @@ def fetch_rss_items(feed_url: str, category: str) -> List[Dict[str, Any]]:
                 "title": title_raw,
                 "title_norm": normalize_title(title_raw),
                 "link": link,
-                "summary": summary,
+                "summary": zh_summary,
+                "raw_summary": raw_summary,
                 "source": source_name,
                 "published_ts": published_ts,
                 "category": category,
@@ -329,6 +403,9 @@ def fetch_news(category: str = "all", limit: int = DEFAULT_NEWS_LIMIT) -> List[D
     return all_items[:limit]
 
 
+# =========================
+# 訊息格式
+# =========================
 def format_news_message(items: List[Dict[str, Any]], category: str = "all") -> str:
     now_str = datetime.now(ZoneInfo(TIMEZONE)).strftime("%Y-%m-%d %H:%M")
 
@@ -360,7 +437,7 @@ def format_news_message(items: List[Dict[str, Any]], category: str = "all") -> s
 
         block = [
             f"<b>{idx}. {title_text}</b>",
-            f"摘要：{summary_text}",
+            f"中文摘要：{summary_text}",
             f"來源：{source_text}",
         ]
 
@@ -411,6 +488,9 @@ def parse_news_command(text: str) -> Dict[str, Any]:
     return {"category": category, "limit": limit}
 
 
+# =========================
+# 推播 / 指令
+# =========================
 def send_daily_news() -> None:
     logger.info("Running scheduled daily news push...")
     chat_ids = get_all_target_chat_ids()
@@ -434,21 +514,18 @@ def send_daily_news() -> None:
         logger.exception("Daily news job failed: %s", e)
 
 
-# =========================
-# 指令處理
-# =========================
 def handle_start(chat_id: int) -> None:
     register_chat_id(chat_id)
 
     msg = (
-        "<b>✅ v3.3 每日新聞功能已啟用</b>\n\n"
+        "<b>✅ v3.4 中文摘要新聞功能已啟用</b>\n\n"
         "可用指令：\n"
         "/news → 查今日科技+商業新聞\n"
         "/news tech → 查科技新聞\n"
         "/news business → 查商業新聞\n"
         "/news 8 → 查 8 則\n"
         "/news tech 6 → 查 6 則科技新聞\n\n"
-        "只要你跟 bot 互動過一次，就會被加入每日推播名單。"
+        "特色：新聞摘要會優先轉成繁體中文。"
     )
     send_message(chat_id, msg)
 
@@ -457,6 +534,7 @@ def handle_help(chat_id: int) -> None:
     msg = (
         "<b>指令說明</b>\n\n"
         "/start\n"
+        "/help\n"
         "/news\n"
         "/news tech\n"
         "/news business\n"
@@ -486,13 +564,10 @@ def handle_unknown(chat_id: int) -> None:
     send_message(chat_id, msg)
 
 
-# =========================
-# 若你要接回原本提醒系統，可放這裡
-# =========================
 def try_handle_existing_reminder_logic(chat_id: int, text: str) -> bool:
     """
-    你原本 v3.2 的提醒功能可以塞到這裡。
-    有處理到就 return True，沒處理到 return False。
+    你原本 v3.2 reminder 的邏輯可塞回這裡。
+    有處理到就 return True，沒處理到就 return False。
     """
     return False
 
@@ -515,16 +590,18 @@ def schedule_jobs() -> None:
 
 
 # =========================
-# Flask Routes
+# Flask routes
 # =========================
 @app.route("/", methods=["GET"])
 def home():
     return jsonify(
         {
             "ok": True,
-            "service": "telegram-bot-v3.3-news",
+            "service": "telegram-bot-v3.4-news-zh-summary",
             "timezone": TIMEZONE,
             "news_push_time": NEWS_PUSH_TIME,
+            "openai_model": OPENAI_MODEL,
+            "chinese_summary_enabled": ENABLE_CHINESE_SUMMARY,
         }
     )
 
