@@ -2,9 +2,10 @@ import os
 import re
 import json
 import html
+import sqlite3
 import logging
-from datetime import datetime
-from typing import List, Dict, Any
+from datetime import datetime, timedelta
+from typing import List, Dict, Any, Optional
 
 import requests
 import feedparser
@@ -19,6 +20,7 @@ from openai import OpenAI
 # 基本設定
 # =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 WEBHOOK_SECRET_PATH = os.getenv("WEBHOOK_SECRET_PATH", "telegram").strip()
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 TIMEZONE = os.getenv("TIMEZONE", os.getenv("TZ", "Asia/Taipei")).strip()
@@ -30,6 +32,8 @@ DEFAULT_NEWS_CATEGORY = os.getenv("DEFAULT_NEWS_CATEGORY", "all").strip().lower(
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 DATA_DIR = os.getenv("DATA_DIR", "data")
 CHAT_FILE = os.path.join(DATA_DIR, "chat_ids.json")
+
+DB_PATH = os.getenv("DB_PATH", os.path.join(DATA_DIR, "bot.db")).strip()
 
 HTTP_TIMEOUT = 20
 
@@ -49,8 +53,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+TZINFO = ZoneInfo(TIMEZONE)
+
 app = Flask(__name__)
-scheduler = BackgroundScheduler(timezone=ZoneInfo(TIMEZONE))
+scheduler = BackgroundScheduler(timezone=TZINFO)
 
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
@@ -67,6 +73,84 @@ RSS_FEEDS = {
         "https://news.google.com/rss/headlines/section/topic/BUSINESS?hl=en-US&gl=US&ceid=US:en",
     ],
 }
+
+
+# =========================
+# DB
+# =========================
+def get_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db() -> None:
+    conn = get_conn()
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS reminders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                remind_at TEXT NOT NULL,
+                message TEXT NOT NULL,
+                sent INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def save_reminder(chat_id: int, remind_at: datetime, message: str) -> int:
+    conn = get_conn()
+    try:
+        cur = conn.execute(
+            """
+            INSERT INTO reminders (chat_id, remind_at, message, sent, created_at)
+            VALUES (?, ?, ?, 0, ?)
+            """,
+            (
+                chat_id,
+                remind_at.isoformat(),
+                message,
+                datetime.now(TZINFO).isoformat(),
+            ),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+    finally:
+        conn.close()
+
+
+def mark_reminder_sent(reminder_id: int) -> None:
+    conn = get_conn()
+    try:
+        conn.execute(
+            "UPDATE reminders SET sent = 1 WHERE id = ?",
+            (reminder_id,)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_pending_reminders() -> List[sqlite3.Row]:
+    conn = get_conn()
+    try:
+        cur = conn.execute(
+            """
+            SELECT id, chat_id, remind_at, message
+            FROM reminders
+            WHERE sent = 0
+            ORDER BY remind_at ASC
+            """
+        )
+        return cur.fetchall()
+    finally:
+        conn.close()
 
 
 # =========================
@@ -104,15 +188,19 @@ def register_chat_id(chat_id: int) -> None:
 
 
 def get_all_target_chat_ids() -> List[int]:
-    ids = load_chat_ids()
+    ids = []
 
     if TELEGRAM_CHAT_ID:
         try:
-            fixed_id = int(TELEGRAM_CHAT_ID)
-            if fixed_id not in ids:
-                ids.append(fixed_id)
+            ids.append(int(TELEGRAM_CHAT_ID))
         except ValueError:
             logger.warning("Invalid TELEGRAM_CHAT_ID: %s", TELEGRAM_CHAT_ID)
+
+    if OWNER_ID:
+        ids.append(OWNER_ID)
+
+    # 保留原有檔案機制，但私人模式下主要仍以 OWNER_ID / TELEGRAM_CHAT_ID 為主
+    ids.extend(load_chat_ids())
 
     return sorted(list(set(ids)))
 
@@ -225,10 +313,6 @@ def build_raw_summary(entry: Dict[str, Any], source_name: str) -> str:
 # OpenAI 中文摘要
 # =========================
 def summarize_to_chinese(title: str, raw_summary: str, source_name: str) -> str:
-    """
-    將英文標題/摘要轉成繁體中文短摘要。
-    失敗時回傳原始摘要的簡短版。
-    """
     fallback = trim_text(raw_summary, 110)
 
     if not ENABLE_CHINESE_SUMMARY:
@@ -372,7 +456,6 @@ def fetch_news(category: str = "all", limit: int = DEFAULT_NEWS_LIMIT) -> List[D
         biz_items = [x for x in all_items if x["category"] == "business"]
 
         mixed: List[Dict[str, Any]] = []
-
         mixed.extend(tech_items[: min(3, len(tech_items))])
 
         remaining = limit - len(mixed)
@@ -407,7 +490,7 @@ def fetch_news(category: str = "all", limit: int = DEFAULT_NEWS_LIMIT) -> List[D
 # 訊息格式
 # =========================
 def format_news_message(items: List[Dict[str, Any]], category: str = "all") -> str:
-    now_str = datetime.now(ZoneInfo(TIMEZONE)).strftime("%Y-%m-%d %H:%M")
+    now_str = datetime.now(TZINFO).strftime("%Y-%m-%d %H:%M")
 
     if category == "tech":
         title = "🧠 今日科技新聞"
@@ -457,16 +540,6 @@ def format_news_message(items: List[Dict[str, Any]], category: str = "all") -> s
 
 
 def parse_news_command(text: str) -> Dict[str, Any]:
-    """
-    支援：
-    /news
-    /news tech
-    /news business
-    /news 科技
-    /news 商業
-    /news 8
-    /news tech 8
-    """
     parts = text.strip().split()
     category = DEFAULT_NEWS_CATEGORY
     limit = DEFAULT_NEWS_LIMIT
@@ -486,6 +559,121 @@ def parse_news_command(text: str) -> Dict[str, Any]:
             limit = max(1, min(10, int(arg2)))
 
     return {"category": category, "limit": limit}
+
+
+# =========================
+# 提醒功能
+# =========================
+def parse_chinese_reminder(text: str) -> Optional[Dict[str, Any]]:
+    """
+    支援範例：
+    - 今天下午5點測試tga
+    - 今天下午5點提醒我測試tga
+    - 明天早上8點開會
+    - 2026-03-27 14:30 開會
+    """
+    raw = text.strip()
+    now = datetime.now(TZINFO)
+
+    # 格式1：YYYY-MM-DD HH:MM 內容
+    m = re.match(r"^\s*(\d{4}-\d{2}-\d{2})\s+(\d{1,2}):(\d{2})\s+(.+?)\s*$", raw)
+    if m:
+        date_str, hour_str, minute_str, msg = m.groups()
+        dt = datetime.strptime(f"{date_str} {hour_str}:{minute_str}", "%Y-%m-%d %H:%M")
+        dt = dt.replace(tzinfo=TZINFO)
+        if dt <= now:
+            return None
+        return {"remind_at": dt, "message": msg.strip()}
+
+    # 格式2：今天/明天 + 上午/下午/晚上/中午 + 幾點(幾分) + 內容
+    m = re.match(
+        r"^\s*(今天|明天)\s*(早上|上午|中午|下午|晚上)?\s*(\d{1,2})(?:[:：點](\d{1,2}))?\s*(?:分)?\s*(提醒我)?\s*(.+?)\s*$",
+        raw
+    )
+    if m:
+        day_word, period, hour_str, minute_str, _, msg = m.groups()
+        base_date = now.date() if day_word == "今天" else (now + timedelta(days=1)).date()
+
+        hour = int(hour_str)
+        minute = int(minute_str) if minute_str is not None else 0
+
+        if period in ("下午", "晚上") and hour < 12:
+            hour += 12
+        elif period in ("中午",):
+            if hour == 12:
+                hour = 12
+            elif hour < 11:
+                hour += 12
+        elif period in ("早上", "上午") and hour == 12:
+            hour = 0
+
+        try:
+            dt = datetime(
+                base_date.year, base_date.month, base_date.day,
+                hour, minute, tzinfo=TZINFO
+            )
+        except ValueError:
+            return None
+
+        if dt <= now:
+            # 今天但時間已過，不自動改明天，避免誤會
+            return None
+
+        return {"remind_at": dt, "message": msg.strip()}
+
+    return None
+
+
+def schedule_one_reminder(reminder_id: int, chat_id: int, remind_at: datetime, message: str) -> None:
+    job_id = f"reminder_{reminder_id}"
+
+    def _send():
+        try:
+            send_message(
+                chat_id,
+                f"⏰ <b>提醒時間到</b>\n\n{html.escape(message)}"
+            )
+            mark_reminder_sent(reminder_id)
+            logger.info("Reminder sent: id=%s chat_id=%s", reminder_id, chat_id)
+        except Exception as e:
+            logger.exception("Failed to send reminder id=%s: %s", reminder_id, e)
+
+    try:
+        scheduler.add_job(
+            _send,
+            trigger="date",
+            run_date=remind_at,
+            id=job_id,
+            replace_existing=True,
+            misfire_grace_time=3600,
+        )
+        logger.info("Reminder scheduled: id=%s at %s", reminder_id, remind_at.isoformat())
+    except Exception as e:
+        logger.exception("Failed to schedule reminder id=%s: %s", reminder_id, e)
+
+
+def load_pending_reminders_into_scheduler() -> None:
+    rows = get_pending_reminders()
+    now = datetime.now(TZINFO)
+
+    for row in rows:
+        reminder_id = int(row["id"])
+        chat_id = int(row["chat_id"])
+        remind_at = datetime.fromisoformat(row["remind_at"])
+        if remind_at.tzinfo is None:
+            remind_at = remind_at.replace(tzinfo=TZINFO)
+
+        if remind_at <= now:
+            # 過時提醒補發一次
+            try:
+                send_message(chat_id, f"⏰ <b>延遲提醒</b>\n\n{html.escape(row['message'])}")
+                mark_reminder_sent(reminder_id)
+                logger.info("Late reminder sent immediately: id=%s", reminder_id)
+            except Exception as e:
+                logger.exception("Failed to send late reminder id=%s: %s", reminder_id, e)
+            continue
+
+        schedule_one_reminder(reminder_id, chat_id, remind_at, row["message"])
 
 
 # =========================
@@ -518,14 +706,17 @@ def handle_start(chat_id: int) -> None:
     register_chat_id(chat_id)
 
     msg = (
-        "<b>✅ v3.4 中文摘要新聞功能已啟用</b>\n\n"
-        "可用指令：\n"
-        "/news → 查今日科技+商業新聞\n"
-        "/news tech → 查科技新聞\n"
-        "/news business → 查商業新聞\n"
-        "/news 8 → 查 8 則\n"
-        "/news tech 6 → 查 6 則科技新聞\n\n"
-        "特色：新聞摘要會優先轉成繁體中文。"
+        "<b>✅ 私人版 bot 已啟用</b>\n\n"
+        "可用功能：\n"
+        "/news\n"
+        "/news tech\n"
+        "/news business\n"
+        "/help\n\n"
+        "提醒範例：\n"
+        "今天下午5點測試tga\n"
+        "明天早上8點提醒我開會\n"
+        "2026-03-27 14:30 開會\n\n"
+        "每日新聞固定於早上 8:00 推播。"
     )
     send_message(chat_id, msg)
 
@@ -537,9 +728,11 @@ def handle_help(chat_id: int) -> None:
         "/help\n"
         "/news\n"
         "/news tech\n"
-        "/news business\n"
-        "/news 8\n"
-        "/news tech 6"
+        "/news business\n\n"
+        "提醒可直接輸入自然語句：\n"
+        "今天下午5點測試tga\n"
+        "明天早上8點提醒我開會\n"
+        "2026-03-27 14:30 開會"
     )
     send_message(chat_id, msg)
 
@@ -554,28 +747,51 @@ def handle_news(chat_id: int, text: str) -> None:
 
 def handle_unknown(chat_id: int) -> None:
     msg = (
-        "目前支援：\n"
+        "我目前支援：\n"
         "/start\n"
         "/help\n"
         "/news\n"
         "/news tech\n"
-        "/news business"
+        "/news business\n\n"
+        "也可以直接輸入提醒，例如：\n"
+        "今天下午5點測試tga"
     )
     send_message(chat_id, msg)
 
 
 def try_handle_existing_reminder_logic(chat_id: int, text: str) -> bool:
-    """
-    你原本 v3.2 reminder 的邏輯可塞回這裡。
-    有處理到就 return True，沒處理到就 return False。
-    """
-    return False
+    parsed = parse_chinese_reminder(text)
+    if not parsed:
+        return False
+
+    remind_at: datetime = parsed["remind_at"]
+    reminder_text: str = parsed["message"]
+
+    reminder_id = save_reminder(chat_id, remind_at, reminder_text)
+    schedule_one_reminder(reminder_id, chat_id, remind_at, reminder_text)
+
+    confirm = (
+        f"✅ 已設定提醒\n"
+        f"時間：{html.escape(remind_at.strftime('%Y-%m-%d %H:%M'))}\n"
+        f"內容：{html.escape(reminder_text)}"
+    )
+    send_message(chat_id, confirm)
+    return True
 
 
 # =========================
 # 排程
 # =========================
 def schedule_jobs() -> None:
+    if not scheduler.running:
+        scheduler.start()
+
+    # 避免重複註冊造成異常
+    try:
+        scheduler.remove_job("daily_news_job")
+    except Exception:
+        pass
+
     hour, minute = NEWS_PUSH_TIME.split(":")
     scheduler.add_job(
         send_daily_news,
@@ -584,8 +800,11 @@ def schedule_jobs() -> None:
         minute=int(minute),
         id="daily_news_job",
         replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=3600,
     )
-    scheduler.start()
+
     logger.info("Scheduler started. Daily news at %s (%s)", NEWS_PUSH_TIME, TIMEZONE)
 
 
@@ -597,9 +816,10 @@ def home():
     return jsonify(
         {
             "ok": True,
-            "service": "telegram-bot-v3.4-news-zh-summary",
+            "service": "telegram-bot-private-news-reminder",
             "timezone": TIMEZONE,
             "news_push_time": NEWS_PUSH_TIME,
+            "owner_id_set": bool(OWNER_ID),
             "openai_model": OPENAI_MODEL,
             "chinese_summary_enabled": ENABLE_CHINESE_SUMMARY,
         }
@@ -622,6 +842,11 @@ def telegram_webhook():
 
         chat_id = message["chat"]["id"]
         text = (message.get("text") or "").strip()
+
+        # 私人化：只允許 OWNER_ID
+        if OWNER_ID and int(chat_id) != OWNER_ID:
+            logger.info("Blocked non-owner: %s", chat_id)
+            return jsonify({"ok": True})
 
         if not text:
             return jsonify({"ok": True})
@@ -653,14 +878,16 @@ def telegram_webhook():
 # 啟動
 # =========================
 def bootstrap() -> None:
+    init_db()
+
     try:
         set_webhook()
     except Exception as e:
         logger.exception("set_webhook failed: %s", e)
 
     try:
-        if not scheduler.running:
-            schedule_jobs()
+        schedule_jobs()
+        load_pending_reminders_into_scheduler()
     except Exception as e:
         logger.exception("scheduler bootstrap failed: %s", e)
 
