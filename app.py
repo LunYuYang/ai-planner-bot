@@ -1,6 +1,3 @@
-from config import *
-from db import init_db
-from telegram_api import send_message
 import os
 import re
 import json
@@ -83,13 +80,48 @@ RSS_FEEDS = {
 # DB
 # =========================
 def get_conn() -> sqlite3.Connection:
-    from db import get_conn
-
-conn = get_conn()
+    conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
 
+def init_db() -> None:
+    conn = get_conn()
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS reminder_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                event_time TEXT NOT NULL,
+                message TEXT NOT NULL,
+                keyword TEXT NOT NULL,
+                canceled INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS reminder_notifications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id INTEGER NOT NULL,
+                chat_id INTEGER NOT NULL,
+                notify_time TEXT NOT NULL,
+                notify_type TEXT NOT NULL,
+                label TEXT NOT NULL,
+                sent INTEGER NOT NULL DEFAULT 0,
+                canceled INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(event_id) REFERENCES reminder_events(id)
+            )
+            """
+        )
+
+        conn.commit()
+    finally:
+        conn.close()
 
 
 # =========================
@@ -163,6 +195,14 @@ def telegram_api(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     return data
 
 
+def send_message(chat_id: int, text: str, disable_web_page_preview: bool = True) -> None:
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": disable_web_page_preview,
+    }
+    telegram_api("sendMessage", payload)
 
 
 def set_webhook() -> None:
