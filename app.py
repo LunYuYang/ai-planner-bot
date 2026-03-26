@@ -82,10 +82,7 @@ RSS_FEEDS = {
 # =========================
 # DB
 # =========================
-def get_conn() -> sqlite3.Connection:
-    conn = get_conn()
-    conn.row_factory = sqlite3.Row
-    return conn
+
 
 
 def init_db() -> None:
