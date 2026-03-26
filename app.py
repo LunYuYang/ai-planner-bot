@@ -1,6 +1,3 @@
-from config import *
-from db import init_db, get_conn
-from telegram_api import send_message
 import os
 import re
 import json
@@ -19,34 +16,33 @@ from apscheduler.jobstores.base import JobLookupError
 from zoneinfo import ZoneInfo
 from openai import OpenAI
 
+from config import (
+    BOT_TOKEN,
+    OWNER_ID,
+    TIMEZONE,
+    RENDER_EXTERNAL_URL,
+    WEBHOOK_SECRET_PATH,
+    DB_PATH,
+    DEFAULT_NEWS_CATEGORY,
+    DEFAULT_NEWS_LIMIT,
+    NEWS_PUSH_TIME,
+    ENABLE_CHINESE_SUMMARY,
+    OPENAI_API_KEY,
+    OPENAI_MODEL,
+    TELEGRAM_CHAT_ID,
+)
+from db import init_db, get_conn
+from telegram_api import send_message
+
 
 # =========================
 # 基本設定
 # =========================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))
-WEBHOOK_SECRET_PATH = os.getenv("WEBHOOK_SECRET_PATH", "telegram").strip()
-RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
-TIMEZONE = os.getenv("TIMEZONE", os.getenv("TZ", "Asia/Taipei")).strip()
-
-NEWS_PUSH_TIME = os.getenv("NEWS_PUSH_TIME", "08:00").strip()
-DEFAULT_NEWS_LIMIT = int(os.getenv("DEFAULT_NEWS_LIMIT", "5"))
-DEFAULT_NEWS_CATEGORY = os.getenv("DEFAULT_NEWS_CATEGORY", "all").strip().lower()
-
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-DATA_DIR = os.getenv("DATA_DIR", "data")
-CHAT_FILE = os.path.join(DATA_DIR, "chat_ids.json")
-DB_PATH = os.getenv("DB_PATH", os.path.join(DATA_DIR, "bot.db")).strip()
-
 HTTP_TIMEOUT = 20
-
-# OpenAI
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
-
-# v3.6：只有每日推播做中文摘要
-ENABLE_CHINESE_SUMMARY = os.getenv("ENABLE_CHINESE_SUMMARY", "true").strip().lower() == "true"
 SUMMARY_ONLY_FOR_DAILY_PUSH = os.getenv("SUMMARY_ONLY_FOR_DAILY_PUSH", "true").strip().lower() == "true"
+
+DATA_DIR = os.getenv("DATA_DIR", os.path.dirname(DB_PATH) or ".").strip()
+CHAT_FILE = os.path.join(DATA_DIR, "chat_ids.json")
 
 if not BOT_TOKEN:
     raise RuntimeError("Missing BOT_TOKEN in environment variables.")
@@ -77,51 +73,6 @@ RSS_FEEDS = {
         "https://news.google.com/rss/headlines/section/topic/BUSINESS?hl=en-US&gl=US&ceid=US:en",
     ],
 }
-
-
-# =========================
-# DB
-# =========================
-
-
-
-def init_db() -> None:
-    conn = get_conn()
-    try:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS reminder_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER NOT NULL,
-                event_time TEXT NOT NULL,
-                message TEXT NOT NULL,
-                keyword TEXT NOT NULL,
-                canceled INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL
-            )
-            """
-        )
-
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS reminder_notifications (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_id INTEGER NOT NULL,
-                chat_id INTEGER NOT NULL,
-                notify_time TEXT NOT NULL,
-                notify_type TEXT NOT NULL,
-                label TEXT NOT NULL,
-                sent INTEGER NOT NULL DEFAULT 0,
-                canceled INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL,
-                FOREIGN KEY(event_id) REFERENCES reminder_events(id)
-            )
-            """
-        )
-
-        conn.commit()
-    finally:
-        conn.close()
 
 
 # =========================
@@ -172,12 +123,7 @@ def get_all_target_chat_ids() -> List[int]:
 
     ids.extend(load_chat_ids())
 
-    final_ids = set(ids)
-    if OWNER_ID:
-        extra = {int(TELEGRAM_CHAT_ID)} if TELEGRAM_CHAT_ID.isdigit() else set()
-        final_ids = {OWNER_ID} | extra | final_ids
-
-    return sorted(list(final_ids))
+    return sorted(list(set(ids)))
 
 
 # =========================
@@ -195,15 +141,12 @@ def telegram_api(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     return data
 
 
-
-
-
 def set_webhook() -> None:
     if not RENDER_EXTERNAL_URL:
         logger.warning("RENDER_EXTERNAL_URL not set. Skip setWebhook.")
         return
 
-    webhook_url = f"{RENDER_EXTERNAL_URL}/{WEBHOOK_SECRET_PATH}"
+    webhook_url = f"{RENDER_EXTERNAL_URL.rstrip('/')}/{WEBHOOK_SECRET_PATH}"
     payload = {"url": webhook_url}
     data = telegram_api("setWebhook", payload)
     logger.info("Webhook set result: %s", data)
@@ -482,35 +425,30 @@ def format_news_message(
 
     if not items:
         return (
-            f"<b>{title}</b>\n"
-            f"更新時間：{html.escape(now_str)}\n\n"
+            f"{title}\n"
+            f"更新時間：{now_str}\n\n"
             "目前抓不到新聞，請稍後再試。"
         )
 
     lines = [
-        f"<b>{title}</b>",
-        f"更新時間：{html.escape(now_str)}",
+        title,
+        f"更新時間：{now_str}",
         "",
     ]
 
     for idx, item in enumerate(items, start=1):
-        title_text = html.escape(item["title"])
-        source_text = html.escape(item["source"])
-        link = item["link"]
-
         block = [
-            f"<b>{idx}. {title_text}</b>",
+            f"{idx}. {item['title']}",
         ]
 
         if include_summary:
             summary_value = item.get("summary") or item.get("raw_summary") or ""
-            block.append(f"摘要：{html.escape(summary_value)}")
+            block.append(f"摘要：{summary_value}")
 
-        block.append(f"來源：{source_text}")
+        block.append(f"來源：{item['source']}")
 
-        if link:
-            safe_link = html.escape(link, quote=True)
-            block.append(f'<a href="{safe_link}">閱讀原文</a>')
+        if item["link"]:
+            block.append(item["link"])
 
         lines.append("\n".join(block))
         lines.append("")
@@ -592,7 +530,6 @@ def parse_absolute_reminder(text: str) -> Optional[Dict[str, Any]]:
     raw = text.strip()
     now = datetime.now(TZINFO)
 
-    # 1️⃣ 完整日期
     m = re.match(r"^\s*(\d{4}-\d{2}-\d{2})\s+(\d{1,2}):(\d{2})\s+(.+?)\s*$", raw)
     if m:
         date_str, hour_str, minute_str, msg = m.groups()
@@ -602,7 +539,6 @@ def parse_absolute_reminder(text: str) -> Optional[Dict[str, Any]]:
             return None
         return {"event_time": dt, "message": msg.strip()}
 
-    # 2️⃣ 中文時間
     m = re.match(
         r"^\s*(今天|明天|昨天)?\s*"
         r"(早上|上午|中午|下午|晚上)?\s*"
@@ -835,8 +771,8 @@ def notification_job_id(notification_id: int) -> str:
 
 def build_notification_text(label: str, event_time: datetime, message: str, event_id: int) -> str:
     return (
-        "⏰ <b>提醒通知</b>\n"
-        f"{html.escape(event_time.strftime('%Y-%m-%d %H:%M'))}｜{html.escape(message)}"
+        "⏰ 提醒通知\n"
+        f"{event_time.strftime('%Y-%m-%d %H:%M')}｜{message}"
     )
 
 
@@ -961,7 +897,7 @@ def handle_start(chat_id: int) -> None:
     register_chat_id(chat_id)
 
     msg = (
-        "<b>✅ Bot 已啟用</b>\n\n"
+        "✅ Bot 已啟用\n\n"
         "可用功能：\n"
         "/news\n"
         "/news tech\n"
@@ -980,7 +916,7 @@ def handle_start(chat_id: int) -> None:
 
 def handle_help(chat_id: int) -> None:
     msg = (
-        "<b>指令說明</b>\n\n"
+        "指令說明\n\n"
         "/start\n"
         "/help\n"
         "/news\n"
@@ -1019,15 +955,15 @@ def handle_list(chat_id: int) -> None:
         send_message(chat_id, "目前沒有未取消事件提醒。")
         return
 
-    lines = ["<b>📌 未取消事件提醒</b>", ""]
+    lines = ["📌 未取消事件提醒", ""]
     for row in rows[:20]:
         event_time = datetime.fromisoformat(row["event_time"])
         if event_time.tzinfo is None:
             event_time = event_time.replace(tzinfo=TZINFO)
 
         lines.append(
-            f"事件代碼：<b>{row['id']}</b>\n"
-            f"{html.escape(event_time.strftime('%Y-%m-%d %H:%M'))}｜{html.escape(row['message'])}"
+            f"事件代碼：{row['id']}\n"
+            f"{event_time.strftime('%Y-%m-%d %H:%M')}｜{row['message']}"
         )
         lines.append("")
 
@@ -1070,7 +1006,7 @@ def handle_cancel_by_keyword(chat_id: int, text: str) -> bool:
 
     row = find_latest_event_by_keyword(chat_id, keyword)
     if not row:
-        send_message(chat_id, f"找不到符合「{html.escape(keyword)}」的未取消事件。")
+        send_message(chat_id, f"找不到符合「{keyword}」的未取消事件。")
         return True
 
     event_id = int(row["id"])
@@ -1095,29 +1031,10 @@ def handle_cancel_by_keyword(chat_id: int, text: str) -> bool:
 
     msg = (
         "✅ 已取消提醒\n"
-        f"{html.escape(event_time.strftime('%Y-%m-%d %H:%M'))}｜{html.escape(row['message'])}"
+        f"{event_time.strftime('%Y-%m-%d %H:%M')}｜{row['message']}"
     )
     send_message(chat_id, msg)
     return True
-
-
-def handle_unknown(chat_id: int) -> None:
-    msg = (
-        "我目前支援：\n"
-        "/start\n"
-        "/help\n"
-        "/news\n"
-        "/news tech\n"
-        "/news business\n"
-        "/list\n"
-        "/cancel 事件代碼\n\n"
-        "也可以直接輸入提醒，例如：\n"
-        "晚上7點半打球\n"
-        "明天晚上7點半打球\n\n"
-        "取消也可直接輸入：\n"
-        "取消打球"
-    )
-    send_message(chat_id, msg)
 
 
 def try_handle_event_reminder(chat_id: int, text: str) -> bool:
@@ -1143,11 +1060,30 @@ def try_handle_event_reminder(chat_id: int, text: str) -> bool:
 
     lines = [
         "✅ 已建立提醒",
-        f"{html.escape(event_time.strftime('%Y-%m-%d %H:%M'))}｜{html.escape(message)}",
+        f"{event_time.strftime('%Y-%m-%d %H:%M')}｜{message}",
     ]
 
     send_message(chat_id, "\n".join(lines))
     return True
+
+
+def handle_unknown(chat_id: int) -> None:
+    msg = (
+        "我目前支援：\n"
+        "/start\n"
+        "/help\n"
+        "/news\n"
+        "/news tech\n"
+        "/news business\n"
+        "/list\n"
+        "/cancel 事件代碼\n\n"
+        "也可以直接輸入提醒，例如：\n"
+        "晚上7點半打球\n"
+        "明天晚上7點半打球\n\n"
+        "取消也可直接輸入：\n"
+        "取消打球"
+    )
+    send_message(chat_id, msg)
 
 
 # =========================
@@ -1188,7 +1124,7 @@ def home():
     return jsonify(
         {
             "ok": True,
-            "service": "telegram-bot-private-news-reminder-v3_6",
+            "service": "telegram-bot-private-news-reminder",
             "timezone": TIMEZONE,
             "news_push_time": NEWS_PUSH_TIME,
             "owner_id_set": bool(OWNER_ID),
@@ -1241,7 +1177,7 @@ def telegram_webhook():
 
             handled = try_handle_event_reminder(chat_id, text)
             if not handled:
-                send_message(chat_id, "⚠️ 時間已過或格式錯誤，請重新輸入")
+                handle_unknown(chat_id)
 
         return jsonify({"ok": True})
 
