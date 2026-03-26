@@ -31,7 +31,7 @@ DEFAULT_NEWS_LIMIT = int(os.getenv("DEFAULT_NEWS_LIMIT", "5"))
 DEFAULT_NEWS_CATEGORY = os.getenv("DEFAULT_NEWS_CATEGORY", "all").strip().lower()
 
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-DATA_DIR = os.getenv("DATA_DIR", "/data")
+DATA_DIR = os.getenv("DATA_DIR", "data")
 CHAT_FILE = os.path.join(DATA_DIR, "chat_ids.json")
 DB_PATH = os.getenv("DB_PATH", os.path.join(DATA_DIR, "bot.db")).strip()
 
