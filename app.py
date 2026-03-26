@@ -87,7 +87,9 @@ def get_conn() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     return conn
 
-
+# =========================
+# chat_id 儲存
+# =========================
 
 def load_chat_ids() -> List[int]:
     if not os.path.exists(CHAT_FILE):
