@@ -40,7 +40,10 @@ HTTP_TIMEOUT = 20
 # OpenAI
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
+
+# v3.6：只有每日推播做中文摘要
 ENABLE_CHINESE_SUMMARY = os.getenv("ENABLE_CHINESE_SUMMARY", "true").strip().lower() == "true"
+SUMMARY_ONLY_FOR_DAILY_PUSH = os.getenv("SUMMARY_ONLY_FOR_DAILY_PUSH", "true").strip().lower() == "true"
 
 if not BOT_TOKEN:
     raise RuntimeError("Missing BOT_TOKEN in environment variables.")
@@ -54,10 +57,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 TZINFO = ZoneInfo(TIMEZONE)
-
 app = Flask(__name__)
 scheduler = BackgroundScheduler(timezone=TZINFO)
-
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 
@@ -89,108 +90,36 @@ def init_db() -> None:
     try:
         conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS reminders (
+            CREATE TABLE IF NOT EXISTS reminder_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 chat_id INTEGER NOT NULL,
-                remind_at TEXT NOT NULL,
+                event_time TEXT NOT NULL,
                 message TEXT NOT NULL,
-                sent INTEGER NOT NULL DEFAULT 0,
+                keyword TEXT NOT NULL,
                 canceled INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL
             )
             """
         )
 
-        # 舊資料庫升級兼容
-        cols = conn.execute("PRAGMA table_info(reminders)").fetchall()
-        col_names = {row[1] for row in cols}
-        if "canceled" not in col_names:
-            conn.execute("ALTER TABLE reminders ADD COLUMN canceled INTEGER NOT NULL DEFAULT 0")
-
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def save_reminder(chat_id: int, remind_at: datetime, message: str) -> int:
-    conn = get_conn()
-    try:
-        cur = conn.execute(
-            """
-            INSERT INTO reminders (chat_id, remind_at, message, sent, canceled, created_at)
-            VALUES (?, ?, ?, 0, 0, ?)
-            """,
-            (
-                chat_id,
-                remind_at.isoformat(),
-                message,
-                datetime.now(TZINFO).isoformat(),
-            ),
-        )
-        conn.commit()
-        return int(cur.lastrowid)
-    finally:
-        conn.close()
-
-
-def mark_reminder_sent(reminder_id: int) -> None:
-    conn = get_conn()
-    try:
         conn.execute(
-            "UPDATE reminders SET sent = 1 WHERE id = ?",
-            (reminder_id,)
+            """
+            CREATE TABLE IF NOT EXISTS reminder_notifications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id INTEGER NOT NULL,
+                chat_id INTEGER NOT NULL,
+                notify_time TEXT NOT NULL,
+                notify_type TEXT NOT NULL,
+                label TEXT NOT NULL,
+                sent INTEGER NOT NULL DEFAULT 0,
+                canceled INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(event_id) REFERENCES reminder_events(id)
+            )
+            """
         )
+
         conn.commit()
-    finally:
-        conn.close()
-
-
-def cancel_reminder(reminder_id: int, chat_id: int) -> bool:
-    conn = get_conn()
-    try:
-        cur = conn.execute(
-            """
-            UPDATE reminders
-            SET canceled = 1
-            WHERE id = ? AND chat_id = ? AND sent = 0 AND canceled = 0
-            """,
-            (reminder_id, chat_id),
-        )
-        conn.commit()
-        return cur.rowcount > 0
-    finally:
-        conn.close()
-
-
-def get_pending_reminders() -> List[sqlite3.Row]:
-    conn = get_conn()
-    try:
-        cur = conn.execute(
-            """
-            SELECT id, chat_id, remind_at, message
-            FROM reminders
-            WHERE sent = 0 AND canceled = 0
-            ORDER BY remind_at ASC
-            """
-        )
-        return cur.fetchall()
-    finally:
-        conn.close()
-
-
-def get_user_pending_reminders(chat_id: int) -> List[sqlite3.Row]:
-    conn = get_conn()
-    try:
-        cur = conn.execute(
-            """
-            SELECT id, chat_id, remind_at, message
-            FROM reminders
-            WHERE chat_id = ? AND sent = 0 AND canceled = 0
-            ORDER BY remind_at ASC
-            """,
-            (chat_id,),
-        )
-        return cur.fetchall()
     finally:
         conn.close()
 
@@ -243,10 +172,10 @@ def get_all_target_chat_ids() -> List[int]:
 
     ids.extend(load_chat_ids())
 
-    # 私人模式：最後仍只保留 OWNER_ID / TELEGRAM_CHAT_ID
     final_ids = set(ids)
     if OWNER_ID:
-        final_ids = {OWNER_ID} | ({int(TELEGRAM_CHAT_ID)} if TELEGRAM_CHAT_ID.isdigit() else set()) | final_ids
+        extra = {int(TELEGRAM_CHAT_ID)} if TELEGRAM_CHAT_ID.isdigit() else set()
+        final_ids = {OWNER_ID} | extra | final_ids
 
     return sorted(list(final_ids))
 
@@ -288,7 +217,7 @@ def set_webhook() -> None:
 
 
 # =========================
-# 文字工具
+# 共用文字工具
 # =========================
 def clean_html_text(raw: str) -> str:
     if not raw:
@@ -437,7 +366,6 @@ def fetch_rss_items(feed_url: str, category: str) -> List[Dict[str, Any]]:
         link = entry.get("link", "").strip()
         source_name = extract_source_name(feed_title, entry)
         raw_summary = build_raw_summary(entry, source_name)
-        zh_summary = summarize_to_chinese(title_raw, raw_summary, source_name)
         published_ts = parse_published_ts(entry)
 
         items.append(
@@ -445,7 +373,7 @@ def fetch_rss_items(feed_url: str, category: str) -> List[Dict[str, Any]]:
                 "title": title_raw,
                 "title_norm": normalize_title(title_raw),
                 "link": link,
-                "summary": zh_summary,
+                "raw_summary": raw_summary,
                 "source": source_name,
                 "published_ts": published_ts,
                 "category": category,
@@ -530,10 +458,26 @@ def fetch_news(category: str = "all", limit: int = DEFAULT_NEWS_LIMIT) -> List[D
     return all_items[:limit]
 
 
-# =========================
-# 訊息格式
-# =========================
-def format_news_message(items: List[Dict[str, Any]], category: str = "all") -> str:
+def enrich_news_with_chinese_summary(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    enriched: List[Dict[str, Any]] = []
+
+    for item in items:
+        new_item = dict(item)
+        new_item["summary"] = summarize_to_chinese(
+            title=item["title"],
+            raw_summary=item["raw_summary"],
+            source_name=item["source"],
+        )
+        enriched.append(new_item)
+
+    return enriched
+
+
+def format_news_message(
+    items: List[Dict[str, Any]],
+    category: str = "all",
+    include_summary: bool = True
+) -> str:
     now_str = datetime.now(TZINFO).strftime("%Y-%m-%d %H:%M")
 
     if category == "tech":
@@ -558,15 +502,18 @@ def format_news_message(items: List[Dict[str, Any]], category: str = "all") -> s
 
     for idx, item in enumerate(items, start=1):
         title_text = html.escape(item["title"])
-        summary_text = html.escape(item["summary"])
         source_text = html.escape(item["source"])
         link = item["link"]
 
         block = [
             f"<b>{idx}. {title_text}</b>",
-            f"中文摘要：{summary_text}",
-            f"來源：{source_text}",
         ]
+
+        if include_summary:
+            summary_value = item.get("summary") or item.get("raw_summary") or ""
+            block.append(f"摘要：{html.escape(summary_value)}")
+
+        block.append(f"來源：{source_text}")
 
         if link:
             safe_link = html.escape(link, quote=True)
@@ -593,6 +540,8 @@ def parse_news_command(text: str) -> Dict[str, Any]:
             category = "tech"
         elif arg1 in ("business", "biz", "商業", "商務"):
             category = "business"
+        elif arg1 in ("all", "全部"):
+            category = "all"
         elif arg1.isdigit():
             limit = max(1, min(10, int(arg1)))
 
@@ -605,44 +554,48 @@ def parse_news_command(text: str) -> Dict[str, Any]:
 
 
 # =========================
-# 提醒功能
+# 提醒功能：事件型
 # =========================
+ADVANCE_REMINDER_RULES = [
+    ("2h", "- 2小時前", timedelta(hours=2)),
+    ("1h", "- 1小時前", timedelta(hours=1)),
+    ("30m", "- 30分鐘前", timedelta(minutes=30)),
+    ("event", "- 事件時間", timedelta(seconds=0)),
+]
+
+
+def normalize_keyword_for_event(message: str) -> str:
+    text = re.sub(r"\s+", "", message.strip().lower())
+    return text[:30] if text else "event"
+
+
 def parse_relative_reminder(text: str) -> Optional[Dict[str, Any]]:
-    """
-    支援：
-    - 30分鐘後提醒我打球
-    - 10分鐘後開會
-    - 2小時後提醒我喝水
-    """
     raw = text.strip()
     now = datetime.now(TZINFO)
 
-    m = re.match(r"^\s*(\d+)\s*(分鐘|分|min|mins|minute|minutes|小時|hr|hrs|hour|hours)\s*後\s*(提醒我)?\s*(.+?)\s*$", raw, re.IGNORECASE)
+    m = re.match(
+        r"^\s*(\d+)\s*(分鐘|分|min|mins|minute|minutes|小時|hr|hrs|hour|hours)\s*後\s*(提醒我)?\s*(.+?)\s*$",
+        raw,
+        re.IGNORECASE
+    )
     if not m:
         return None
 
     amount_str, unit, _, msg = m.groups()
     amount = int(amount_str)
-
     if amount <= 0:
         return None
 
     unit = unit.lower()
     if unit in ("分鐘", "分", "min", "mins", "minute", "minutes"):
-        remind_at = now + timedelta(minutes=amount)
+        event_time = now + timedelta(minutes=amount)
     else:
-        remind_at = now + timedelta(hours=amount)
+        event_time = now + timedelta(hours=amount)
 
-    return {"remind_at": remind_at, "message": msg.strip()}
+    return {"event_time": event_time, "message": msg.strip()}
 
 
 def parse_absolute_reminder(text: str) -> Optional[Dict[str, Any]]:
-    """
-    支援：
-    - 2026-03-27 14:30 開會
-    - 今天下午5點打球
-    - 明天早上8點提醒我開會
-    """
     raw = text.strip()
     now = datetime.now(TZINFO)
 
@@ -653,7 +606,7 @@ def parse_absolute_reminder(text: str) -> Optional[Dict[str, Any]]:
         dt = dt.replace(tzinfo=TZINFO)
         if dt <= now:
             return None
-        return {"remind_at": dt, "message": msg.strip()}
+        return {"event_time": dt, "message": msg.strip()}
 
     m = re.match(
         r"^\s*(今天|明天)\s*(早上|上午|中午|下午|晚上)?\s*(\d{1,2})(?:[:：點](\d{1,2}))?\s*(?:分)?\s*(提醒我)?\s*(.+?)\s*$",
@@ -689,7 +642,7 @@ def parse_absolute_reminder(text: str) -> Optional[Dict[str, Any]]:
         if dt <= now:
             return None
 
-        return {"remind_at": dt, "message": msg.strip()}
+        return {"event_time": dt, "message": msg.strip()}
 
     return None
 
@@ -698,20 +651,208 @@ def parse_chinese_reminder(text: str) -> Optional[Dict[str, Any]]:
     return parse_relative_reminder(text) or parse_absolute_reminder(text)
 
 
-def reminder_job_id(reminder_id: int) -> str:
-    return f"reminder_{reminder_id}"
+def save_event_with_notifications(chat_id: int, event_time: datetime, message: str) -> Dict[str, Any]:
+    conn = get_conn()
+    try:
+        keyword = normalize_keyword_for_event(message)
+        now_iso = datetime.now(TZINFO).isoformat()
+
+        cur = conn.execute(
+            """
+            INSERT INTO reminder_events (chat_id, event_time, message, keyword, canceled, created_at)
+            VALUES (?, ?, ?, ?, 0, ?)
+            """,
+            (chat_id, event_time.isoformat(), message, keyword, now_iso)
+        )
+        event_id = int(cur.lastrowid)
+
+        notifications = []
+        for notify_type, label, delta in ADVANCE_REMINDER_RULES:
+            notify_time = event_time - delta if delta.total_seconds() > 0 else event_time
+
+            # 已經過去的提前提醒不建立，避免剛建立就瞬間連發
+            if notify_time <= datetime.now(TZINFO) and notify_type != "event":
+                continue
+
+            cur2 = conn.execute(
+                """
+                INSERT INTO reminder_notifications
+                (event_id, chat_id, notify_time, notify_type, label, sent, canceled, created_at)
+                VALUES (?, ?, ?, ?, ?, 0, 0, ?)
+                """,
+                (
+                    event_id,
+                    chat_id,
+                    notify_time.isoformat(),
+                    notify_type,
+                    label,
+                    now_iso,
+                )
+            )
+            notifications.append(
+                {
+                    "notification_id": int(cur2.lastrowid),
+                    "notify_time": notify_time,
+                    "notify_type": notify_type,
+                    "label": label,
+                }
+            )
+
+        conn.commit()
+        return {
+            "event_id": event_id,
+            "event_time": event_time,
+            "message": message,
+            "keyword": keyword,
+            "notifications": notifications,
+        }
+    finally:
+        conn.close()
 
 
-def schedule_one_reminder(reminder_id: int, chat_id: int, remind_at: datetime, message: str) -> None:
-    job_id = reminder_job_id(reminder_id)
+def get_pending_notifications() -> List[sqlite3.Row]:
+    conn = get_conn()
+    try:
+        cur = conn.execute(
+            """
+            SELECT
+                rn.id,
+                rn.event_id,
+                rn.chat_id,
+                rn.notify_time,
+                rn.notify_type,
+                rn.label,
+                re.event_time,
+                re.message
+            FROM reminder_notifications rn
+            JOIN reminder_events re ON rn.event_id = re.id
+            WHERE rn.sent = 0 AND rn.canceled = 0 AND re.canceled = 0
+            ORDER BY rn.notify_time ASC
+            """
+        )
+        return cur.fetchall()
+    finally:
+        conn.close()
+
+
+def get_user_pending_events(chat_id: int) -> List[sqlite3.Row]:
+    conn = get_conn()
+    try:
+        cur = conn.execute(
+            """
+            SELECT id, event_time, message, keyword
+            FROM reminder_events
+            WHERE chat_id = ? AND canceled = 0
+            ORDER BY event_time ASC
+            """,
+            (chat_id,)
+        )
+        return cur.fetchall()
+    finally:
+        conn.close()
+
+
+def mark_notification_sent(notification_id: int) -> None:
+    conn = get_conn()
+    try:
+        conn.execute(
+            "UPDATE reminder_notifications SET sent = 1 WHERE id = ?",
+            (notification_id,)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def cancel_event_by_id(event_id: int, chat_id: int) -> bool:
+    conn = get_conn()
+    try:
+        cur = conn.execute(
+            """
+            UPDATE reminder_events
+            SET canceled = 1
+            WHERE id = ? AND chat_id = ? AND canceled = 0
+            """,
+            (event_id, chat_id)
+        )
+        if cur.rowcount <= 0:
+            conn.commit()
+            return False
+
+        conn.execute(
+            """
+            UPDATE reminder_notifications
+            SET canceled = 1
+            WHERE event_id = ?
+            """,
+            (event_id,)
+        )
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+def find_latest_event_by_keyword(chat_id: int, keyword: str) -> Optional[sqlite3.Row]:
+    conn = get_conn()
+    try:
+        cur = conn.execute(
+            """
+            SELECT id, event_time, message, keyword
+            FROM reminder_events
+            WHERE chat_id = ?
+              AND canceled = 0
+              AND (
+                    lower(message) LIKE ?
+                    OR lower(keyword) LIKE ?
+                  )
+            ORDER BY event_time DESC
+            LIMIT 1
+            """,
+            (chat_id, f"%{keyword.lower()}%", f"%{keyword.lower()}%")
+        )
+        return cur.fetchone()
+    finally:
+        conn.close()
+
+
+def notification_job_id(notification_id: int) -> str:
+    return f"notify_{notification_id}"
+
+
+def build_notification_text(label: str, event_time: datetime, message: str, event_id: int) -> str:
+    return (
+        "⏰ <b>提醒通知</b>\n"
+        f"事件代碼：<b>{event_id}</b>\n"
+        f"事件：{html.escape(event_time.strftime('%Y-%m-%d %H:%M'))}｜{html.escape(message)}\n"
+        f"提醒時間：{html.escape(label)}"
+    )
+
+
+def schedule_one_notification(
+    notification_id: int,
+    event_id: int,
+    chat_id: int,
+    notify_time: datetime,
+    label: str,
+    event_time: datetime,
+    message: str
+) -> None:
+    job_id = notification_job_id(notification_id)
 
     def _send():
         try:
-            send_message(chat_id, f"⏰ <b>提醒時間到</b>\n\n{html.escape(message)}")
-            mark_reminder_sent(reminder_id)
-            logger.info("Reminder sent: id=%s chat_id=%s", reminder_id, chat_id)
+            text = build_notification_text(
+                label=label,
+                event_time=event_time,
+                message=message,
+                event_id=event_id,
+            )
+            send_message(chat_id, text)
+            mark_notification_sent(notification_id)
+            logger.info("Notification sent: id=%s event_id=%s", notification_id, event_id)
         except Exception as e:
-            logger.exception("Failed to send reminder id=%s: %s", reminder_id, e)
+            logger.exception("Failed to send notification id=%s: %s", notification_id, e)
 
     try:
         try:
@@ -722,37 +863,54 @@ def schedule_one_reminder(reminder_id: int, chat_id: int, remind_at: datetime, m
         scheduler.add_job(
             _send,
             trigger="date",
-            run_date=remind_at,
+            run_date=notify_time,
             id=job_id,
             replace_existing=True,
             misfire_grace_time=3600,
         )
-        logger.info("Reminder scheduled: id=%s at %s", reminder_id, remind_at.isoformat())
     except Exception as e:
-        logger.exception("Failed to schedule reminder id=%s: %s", reminder_id, e)
+        logger.exception("Failed to schedule notification id=%s: %s", notification_id, e)
 
 
-def load_pending_reminders_into_scheduler() -> None:
-    rows = get_pending_reminders()
+def load_pending_notifications_into_scheduler() -> None:
+    rows = get_pending_notifications()
     now = datetime.now(TZINFO)
 
     for row in rows:
-        reminder_id = int(row["id"])
+        notification_id = int(row["id"])
+        event_id = int(row["event_id"])
         chat_id = int(row["chat_id"])
-        remind_at = datetime.fromisoformat(row["remind_at"])
-        if remind_at.tzinfo is None:
-            remind_at = remind_at.replace(tzinfo=TZINFO)
 
-        if remind_at <= now:
+        notify_time = datetime.fromisoformat(row["notify_time"])
+        if notify_time.tzinfo is None:
+            notify_time = notify_time.replace(tzinfo=TZINFO)
+
+        event_time = datetime.fromisoformat(row["event_time"])
+        if event_time.tzinfo is None:
+            event_time = event_time.replace(tzinfo=TZINFO)
+
+        label = row["label"]
+        message = row["message"]
+
+        if notify_time <= now:
             try:
-                send_message(chat_id, f"⏰ <b>延遲提醒</b>\n\n{html.escape(row['message'])}")
-                mark_reminder_sent(reminder_id)
-                logger.info("Late reminder sent immediately: id=%s", reminder_id)
+                text = build_notification_text(label, event_time, message, event_id)
+                send_message(chat_id, text)
+                mark_notification_sent(notification_id)
+                logger.info("Late notification sent immediately: id=%s", notification_id)
             except Exception as e:
-                logger.exception("Failed to send late reminder id=%s: %s", reminder_id, e)
+                logger.exception("Failed to send late notification id=%s: %s", notification_id, e)
             continue
 
-        schedule_one_reminder(reminder_id, chat_id, remind_at, row["message"])
+        schedule_one_notification(
+            notification_id=notification_id,
+            event_id=event_id,
+            chat_id=chat_id,
+            notify_time=notify_time,
+            label=label,
+            event_time=event_time,
+            message=message,
+        )
 
 
 # =========================
@@ -768,7 +926,15 @@ def send_daily_news() -> None:
 
     try:
         items = fetch_news(category=DEFAULT_NEWS_CATEGORY, limit=DEFAULT_NEWS_LIMIT)
-        message = format_news_message(items, category=DEFAULT_NEWS_CATEGORY)
+
+        if ENABLE_CHINESE_SUMMARY:
+            items = enrich_news_with_chinese_summary(items)
+
+        message = format_news_message(
+            items,
+            category=DEFAULT_NEWS_CATEGORY,
+            include_summary=True
+        )
 
         for chat_id in chat_ids:
             try:
@@ -784,20 +950,25 @@ def handle_start(chat_id: int) -> None:
     register_chat_id(chat_id)
 
     msg = (
-        "<b>✅ v3.5 最終整合版已啟用</b>\n\n"
+        "<b>✅ v3.6 詳細提醒版已啟用</b>\n\n"
         "可用功能：\n"
         "/news\n"
         "/news tech\n"
         "/news business\n"
         "/list\n"
-        "/cancel 1\n"
+        "/cancel 事件代碼\n"
         "/help\n\n"
-        "提醒範例：\n"
-        "今天下午5點打球\n"
-        "明天早上8點提醒我開會\n"
+        "提醒可直接輸入：\n"
+        "今天晚上8點打球\n"
+        "明天下午4點製sem樣品\n"
         "2026-03-27 14:30 開會\n"
         "30分鐘後提醒我喝水\n\n"
-        "每日新聞固定於早上 8:00 推播。"
+        "建立事件後會自動加入：\n"
+        "- 2小時前\n"
+        "- 1小時前\n"
+        "- 30分鐘前\n"
+        "- 事件時間\n\n"
+        "也支援直接輸入：取消sem"
     )
     send_message(chat_id, msg)
 
@@ -811,12 +982,14 @@ def handle_help(chat_id: int) -> None:
         "/news tech\n"
         "/news business\n"
         "/list\n"
-        "/cancel 編號\n\n"
-        "提醒可直接輸入：\n"
-        "今天下午5點打球\n"
-        "明天早上8點提醒我開會\n"
-        "2026-03-27 14:30 開會\n"
-        "30分鐘後提醒我喝水"
+        "/cancel 事件代碼\n\n"
+        "提醒輸入範例：\n"
+        "今天晚上8點打球\n"
+        "明天下午4點製sem樣品\n"
+        "30分鐘後提醒我喝水\n\n"
+        "取消範例：\n"
+        "/cancel 12\n"
+        "取消sem"
     )
     send_message(chat_id, msg)
 
@@ -825,24 +998,33 @@ def handle_news(chat_id: int, text: str) -> None:
     register_chat_id(chat_id)
     args = parse_news_command(text)
     items = fetch_news(category=args["category"], limit=args["limit"])
-    msg = format_news_message(items, category=args["category"])
+
+    if ENABLE_CHINESE_SUMMARY and not SUMMARY_ONLY_FOR_DAILY_PUSH:
+        items = enrich_news_with_chinese_summary(items)
+        msg = format_news_message(items, category=args["category"], include_summary=True)
+    else:
+        msg = format_news_message(items, category=args["category"], include_summary=False)
+
     send_message(chat_id, msg)
 
 
 def handle_list(chat_id: int) -> None:
-    reminders = get_user_pending_reminders(chat_id)
-    if not reminders:
-        send_message(chat_id, "目前沒有未完成提醒。")
+    rows = get_user_pending_events(chat_id)
+    if not rows:
+        send_message(chat_id, "目前沒有未取消事件提醒。")
         return
 
-    lines = ["<b>📌 未完成提醒</b>", ""]
-    for row in reminders[:20]:
-        remind_at = datetime.fromisoformat(row["remind_at"])
-        if remind_at.tzinfo is None:
-            remind_at = remind_at.replace(tzinfo=TZINFO)
+    lines = ["<b>📌 未取消事件提醒</b>", ""]
+    for row in rows[:20]:
+        event_time = datetime.fromisoformat(row["event_time"])
+        if event_time.tzinfo is None:
+            event_time = event_time.replace(tzinfo=TZINFO)
+
         lines.append(
-            f"#{row['id']}｜{html.escape(remind_at.strftime('%Y-%m-%d %H:%M'))}\n"
-            f"{html.escape(row['message'])}"
+            f"事件代碼：<b>{row['id']}</b>\n"
+            f"時間：{html.escape(event_time.strftime('%Y-%m-%d %H:%M'))}\n"
+            f"內容：{html.escape(row['message'])}\n"
+            f"關鍵字：{html.escape(row['keyword'])}"
         )
         lines.append("")
 
@@ -852,23 +1034,69 @@ def handle_list(chat_id: int) -> None:
 def handle_cancel(chat_id: int, text: str) -> None:
     m = re.match(r"^/cancel\s+(\d+)\s*$", text.strip())
     if not m:
-        send_message(chat_id, "用法：/cancel 1")
+        send_message(chat_id, "用法：/cancel 事件代碼")
         return
 
-    reminder_id = int(m.group(1))
-    ok = cancel_reminder(reminder_id, chat_id)
+    event_id = int(m.group(1))
+    ok = cancel_event_by_id(event_id, chat_id)
     if not ok:
-        send_message(chat_id, f"找不到可取消的提醒 #{reminder_id}")
+        send_message(chat_id, f"找不到可取消的事件代碼 #{event_id}")
         return
 
-    try:
-        scheduler.remove_job(reminder_job_id(reminder_id))
-    except JobLookupError:
-        pass
-    except Exception as e:
-        logger.exception("Failed to remove reminder job id=%s: %s", reminder_id, e)
+    # scheduler 清掉 job
+    pending = get_pending_notifications()
+    for row in pending:
+        if int(row["event_id"]) == event_id:
+            try:
+                scheduler.remove_job(notification_job_id(int(row["id"])))
+            except JobLookupError:
+                pass
+            except Exception as e:
+                logger.exception("remove job failed: %s", e)
 
-    send_message(chat_id, f"✅ 已取消提醒 #{reminder_id}")
+    send_message(chat_id, f"✅ 已取消事件提醒 #{event_id}")
+
+
+def handle_cancel_by_keyword(chat_id: int, text: str) -> bool:
+    m = re.match(r"^\s*取消\s*(.+?)\s*$", text)
+    if not m:
+        return False
+
+    keyword = m.group(1).strip()
+    if not keyword:
+        return False
+
+    row = find_latest_event_by_keyword(chat_id, keyword)
+    if not row:
+        send_message(chat_id, f"找不到符合「{html.escape(keyword)}」的未取消事件。")
+        return True
+
+    event_id = int(row["id"])
+    event_time = datetime.fromisoformat(row["event_time"])
+    if event_time.tzinfo is None:
+        event_time = event_time.replace(tzinfo=TZINFO)
+
+    ok = cancel_event_by_id(event_id, chat_id)
+    if not ok:
+        send_message(chat_id, "取消失敗，請稍後再試。")
+        return True
+
+    pending = get_pending_notifications()
+    for n in pending:
+        if int(n["event_id"]) == event_id:
+            try:
+                scheduler.remove_job(notification_job_id(int(n["id"])))
+            except JobLookupError:
+                pass
+            except Exception as e:
+                logger.exception("remove job failed: %s", e)
+
+    msg = (
+        f"✅ 已取消 1 組事件提醒：\n"
+        f"- {html.escape(event_time.strftime('%Y-%m-%d %H:%M'))}｜{html.escape(row['message'])}"
+    )
+    send_message(chat_id, msg)
+    return True
 
 
 def handle_unknown(chat_id: int) -> None:
@@ -880,31 +1108,48 @@ def handle_unknown(chat_id: int) -> None:
         "/news tech\n"
         "/news business\n"
         "/list\n"
-        "/cancel 1\n\n"
+        "/cancel 事件代碼\n\n"
         "也可以直接輸入提醒，例如：\n"
-        "今天下午5點打球"
+        "今天晚上8點打球\n"
+        "明天下午4點製sem樣品\n\n"
+        "取消也可直接輸入：\n"
+        "取消sem"
     )
     send_message(chat_id, msg)
 
 
-def try_handle_existing_reminder_logic(chat_id: int, text: str) -> bool:
+def try_handle_event_reminder(chat_id: int, text: str) -> bool:
     parsed = parse_chinese_reminder(text)
     if not parsed:
         return False
 
-    remind_at: datetime = parsed["remind_at"]
-    reminder_text: str = parsed["message"]
+    event_time: datetime = parsed["event_time"]
+    message: str = parsed["message"]
 
-    reminder_id = save_reminder(chat_id, remind_at, reminder_text)
-    schedule_one_reminder(reminder_id, chat_id, remind_at, reminder_text)
+    result = save_event_with_notifications(chat_id, event_time, message)
 
-    confirm = (
-        f"✅ 已設定提醒\n"
-        f"編號：#{reminder_id}\n"
-        f"時間：{html.escape(remind_at.strftime('%Y-%m-%d %H:%M'))}\n"
-        f"內容：{html.escape(reminder_text)}"
-    )
-    send_message(chat_id, confirm)
+    for n in result["notifications"]:
+        schedule_one_notification(
+            notification_id=n["notification_id"],
+            event_id=result["event_id"],
+            chat_id=chat_id,
+            notify_time=n["notify_time"],
+            label=n["label"],
+            event_time=event_time,
+            message=message,
+        )
+
+    lines = [
+        "✅ 已建立整組提醒",
+        f"事件代碼：{result['event_id']}",
+        f"事件：{html.escape(event_time.strftime('%Y-%m-%d %H:%M'))}｜{html.escape(message)}",
+        "提醒時間：",
+    ]
+
+    for n in result["notifications"]:
+        lines.append(f"{n['label']}：{html.escape(n['notify_time'].strftime('%Y-%m-%d %H:%M'))}")
+
+    send_message(chat_id, "\n".join(lines))
     return True
 
 
@@ -946,12 +1191,13 @@ def home():
     return jsonify(
         {
             "ok": True,
-            "service": "telegram-bot-private-news-reminder-final",
+            "service": "telegram-bot-private-news-reminder-v3_6-detailed",
             "timezone": TIMEZONE,
             "news_push_time": NEWS_PUSH_TIME,
             "owner_id_set": bool(OWNER_ID),
             "openai_model": OPENAI_MODEL,
             "chinese_summary_enabled": ENABLE_CHINESE_SUMMARY,
+            "summary_only_for_daily_push": SUMMARY_ONLY_FOR_DAILY_PUSH,
         }
     )
 
@@ -973,7 +1219,6 @@ def telegram_webhook():
         chat_id = int(message["chat"]["id"])
         text = (message.get("text") or "").strip()
 
-        # 私人模式：只允許 OWNER_ID
         if OWNER_ID and chat_id != OWNER_ID:
             logger.info("Blocked non-owner: %s", chat_id)
             return jsonify({"ok": True})
@@ -994,7 +1239,10 @@ def telegram_webhook():
         elif text.startswith("/cancel"):
             handle_cancel(chat_id, text)
         else:
-            handled = try_handle_existing_reminder_logic(chat_id, text)
+            if handle_cancel_by_keyword(chat_id, text):
+                return jsonify({"ok": True})
+
+            handled = try_handle_event_reminder(chat_id, text)
             if not handled:
                 handle_unknown(chat_id)
 
@@ -1018,7 +1266,7 @@ def bootstrap() -> None:
 
     try:
         schedule_jobs()
-        load_pending_reminders_into_scheduler()
+        load_pending_notifications_into_scheduler()
     except Exception as e:
         logger.exception("scheduler bootstrap failed: %s", e)
 
