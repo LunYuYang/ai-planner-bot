@@ -88,48 +88,7 @@ def get_conn() -> sqlite3.Connection:
     return conn
 
 
-def init_db() -> None:
-    conn = get_conn()
-    try:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS reminder_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER NOT NULL,
-                event_time TEXT NOT NULL,
-                message TEXT NOT NULL,
-                keyword TEXT NOT NULL,
-                canceled INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL
-            )
-            """
-        )
 
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS reminder_notifications (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_id INTEGER NOT NULL,
-                chat_id INTEGER NOT NULL,
-                notify_time TEXT NOT NULL,
-                notify_type TEXT NOT NULL,
-                label TEXT NOT NULL,
-                sent INTEGER NOT NULL DEFAULT 0,
-                canceled INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL,
-                FOREIGN KEY(event_id) REFERENCES reminder_events(id)
-            )
-            """
-        )
-
-        conn.commit()
-    finally:
-        conn.close()
-
-
-# =========================
-# chat_id 儲存
-# =========================
 def load_chat_ids() -> List[int]:
     if not os.path.exists(CHAT_FILE):
         return []
