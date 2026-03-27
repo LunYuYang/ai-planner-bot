@@ -44,7 +44,7 @@ DATA_DIR = os.getenv("DATA_DIR", os.path.dirname(DB_PATH) or ".").strip()
 CHAT_FILE = os.path.join(DATA_DIR, "chat_ids.json")
 
 CWA_API_KEY = os.getenv("CWA_API_KEY", "").strip()
-DEFAULT_WEATHER_CITY = os.getenv("DEFAULT_WEATHER_CITY", "臺中市").strip()
+DEFAULT_WEATHER_CITY = os.getenv("DEFAULT_WEATHER_CITY", "臺南市").strip()
 WEATHER_PUSH_TIME = os.getenv("WEATHER_PUSH_TIME", "").strip()
 
 if not BOT_TOKEN:
@@ -839,11 +839,35 @@ def get_notification_ids_by_event(event_id: int) -> List[int]:
             """
             SELECT id
             FROM reminder_notifications
-            WHERE event_id = ? AND sent = 0 AND canceled = 0
+            WHERE event_id = ? AND sent = 0
             """,
             (event_id,)
         )
         return [int(row["id"]) for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def is_notification_active(notification_id: int) -> bool:
+    conn = get_conn()
+    try:
+        cur = conn.execute(
+            """
+            SELECT rn.sent, rn.canceled, re.canceled AS event_canceled
+            FROM reminder_notifications rn
+            JOIN reminder_events re ON rn.event_id = re.id
+            WHERE rn.id = ?
+            """,
+            (notification_id,)
+        )
+        row = cur.fetchone()
+        if not row:
+            return False
+        return (
+            int(row["sent"]) == 0
+            and int(row["canceled"]) == 0
+            and int(row["event_canceled"]) == 0
+        )
     finally:
         conn.close()
 
@@ -1067,6 +1091,10 @@ def schedule_one_notification(
 
     def _send():
         try:
+            if not is_notification_active(notification_id):
+                logger.info("Skip inactive notification id=%s", notification_id)
+                return
+
             text = build_notification_text(
                 label=label,
                 event_time=event_time,
@@ -1130,6 +1158,10 @@ def load_pending_notifications_into_scheduler() -> None:
 
         if notify_time <= now:
             try:
+                if not is_notification_active(notification_id):
+                    logger.info("Skip inactive late notification id=%s", notification_id)
+                    continue
+
                 text = build_notification_text(label, event_time, message, event_id)
                 send_message(chat_id, text)
                 mark_notification_sent(notification_id)
@@ -1271,12 +1303,12 @@ def handle_cancel(chat_id: int, text: str) -> None:
         return
 
     event_id = int(m.group(1))
+    remove_scheduled_jobs_for_event(event_id)
     ok = cancel_event_by_id(event_id, chat_id)
     if not ok:
         send_message(chat_id, f"找不到可取消的事件代碼 #{event_id}")
         return
 
-    remove_scheduled_jobs_for_event(event_id)
     send_message(chat_id, "✅ 已取消提醒")
 
 
@@ -1299,12 +1331,11 @@ def handle_cancel_by_keyword(chat_id: int, text: str) -> bool:
     if event_time.tzinfo is None:
         event_time = event_time.replace(tzinfo=TZINFO)
 
+    remove_scheduled_jobs_for_event(event_id)
     ok = cancel_event_by_id(event_id, chat_id)
     if not ok:
         send_message(chat_id, "取消失敗，請稍後再試。")
         return True
-
-    remove_scheduled_jobs_for_event(event_id)
 
     msg = (
         "✅ 已取消提醒\n"
@@ -1326,8 +1357,8 @@ def try_handle_event_reminder(chat_id: int, text: str) -> bool:
     duplicate = find_duplicate_event(chat_id, event_time, message)
     if duplicate:
         old_event_id = int(duplicate["id"])
+        remove_scheduled_jobs_for_event(old_event_id)
         if cancel_event_by_id(old_event_id, chat_id):
-            remove_scheduled_jobs_for_event(old_event_id)
             replaced = True
 
     result = save_event_with_notifications(chat_id, event_time, message)
