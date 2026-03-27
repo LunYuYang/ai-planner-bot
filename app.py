@@ -980,6 +980,35 @@ def get_pending_notifications() -> List[sqlite3.Row]:
         conn.close()
 
 
+def get_due_unsent_notifications() -> List[sqlite3.Row]:
+    conn = get_conn()
+    try:
+        cur = conn.execute(
+            """
+            SELECT
+                rn.id,
+                rn.event_id,
+                rn.chat_id,
+                rn.notify_time,
+                rn.notify_type,
+                rn.label,
+                re.event_time,
+                re.message
+            FROM reminder_notifications rn
+            JOIN reminder_events re ON rn.event_id = re.id
+            WHERE rn.sent = 0
+              AND rn.canceled = 0
+              AND re.canceled = 0
+              AND rn.notify_time <= ?
+            ORDER BY rn.notify_time ASC
+            """,
+            (datetime.now(TZINFO).isoformat(),)
+        )
+        return cur.fetchall()
+    finally:
+        conn.close()
+
+
 def get_user_pending_events(chat_id: int) -> List[sqlite3.Row]:
     conn = get_conn()
     try:
@@ -1136,6 +1165,47 @@ def remove_scheduled_jobs_for_event(event_id: int) -> None:
             logger.exception("Failed removing notification job id=%s: %s", notification_id, e)
 
 
+def catch_up_missed_notifications() -> None:
+    try:
+        rows = get_due_unsent_notifications()
+        if not rows:
+            return
+
+        logger.info("Catch-up scan found %s due unsent notifications", len(rows))
+
+        for row in rows:
+            notification_id = int(row["id"])
+            event_id = int(row["event_id"])
+            chat_id = int(row["chat_id"])
+
+            if not is_notification_active(notification_id):
+                logger.info("Skip inactive catch-up notification id=%s", notification_id)
+                continue
+
+            event_time = datetime.fromisoformat(row["event_time"])
+            if event_time.tzinfo is None:
+                event_time = event_time.replace(tzinfo=TZINFO)
+
+            label = row["label"]
+            message = row["message"]
+
+            text = build_notification_text(label, event_time, message, event_id)
+            send_message(chat_id, text)
+            mark_notification_sent(notification_id)
+
+            try:
+                scheduler.remove_job(notification_job_id(notification_id))
+            except JobLookupError:
+                pass
+            except Exception as e:
+                logger.exception("Failed removing catch-up job id=%s: %s", notification_id, e)
+
+            logger.info("Catch-up notification sent: id=%s event_id=%s", notification_id, event_id)
+
+    except Exception as e:
+        logger.exception("Catch-up missed notifications failed: %s", e)
+
+
 def load_pending_notifications_into_scheduler() -> None:
     rows = get_pending_notifications()
     now = datetime.now(TZINFO)
@@ -1157,17 +1227,6 @@ def load_pending_notifications_into_scheduler() -> None:
         message = row["message"]
 
         if notify_time <= now:
-            try:
-                if not is_notification_active(notification_id):
-                    logger.info("Skip inactive late notification id=%s", notification_id)
-                    continue
-
-                text = build_notification_text(label, event_time, message, event_id)
-                send_message(chat_id, text)
-                mark_notification_sent(notification_id)
-                logger.info("Late notification sent immediately: id=%s", notification_id)
-            except Exception as e:
-                logger.exception("Failed to send late notification id=%s: %s", notification_id, e)
             continue
 
         schedule_one_notification(
@@ -1467,7 +1526,26 @@ def schedule_jobs() -> None:
         except Exception as e:
             logger.exception("Failed scheduling daily weather: %s", e)
 
+    try:
+        scheduler.remove_job("catch_up_notifications_job")
+    except JobLookupError:
+        pass
+    except Exception as e:
+        logger.exception("Failed removing old catch_up_notifications_job: %s", e)
+
+    scheduler.add_job(
+        catch_up_missed_notifications,
+        trigger="interval",
+        minutes=1,
+        id="catch_up_notifications_job",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=3600,
+    )
+
     logger.info("Scheduler started. Daily news at %s (%s)", NEWS_PUSH_TIME, TIMEZONE)
+    logger.info("Catch-up scan scheduled every 1 minute")
 
 
 # =========================
@@ -1562,6 +1640,7 @@ def bootstrap() -> None:
     try:
         schedule_jobs()
         load_pending_notifications_into_scheduler()
+        catch_up_missed_notifications()
     except Exception as e:
         logger.exception("scheduler bootstrap failed: %s", e)
 
