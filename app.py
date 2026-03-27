@@ -2,7 +2,6 @@ import os
 import re
 import json
 import html
-import sqlite3
 import logging
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
@@ -62,6 +61,18 @@ TZINFO = ZoneInfo(TIMEZONE)
 app = Flask(__name__)
 scheduler = BackgroundScheduler(timezone=TZINFO)
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+
+
+def parse_db_datetime(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        dt = datetime.fromisoformat(str(value))
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=TZINFO)
+
+    return dt
 
 
 # =========================
@@ -835,15 +846,17 @@ def parse_chinese_reminder(text: str) -> Optional[Dict[str, Any]]:
 def get_notification_ids_by_event(event_id: int) -> List[int]:
     conn = get_conn()
     try:
-        cur = conn.execute(
-            """
-            SELECT id
-            FROM reminder_notifications
-            WHERE event_id = ? AND sent = 0
-            """,
-            (event_id,)
-        )
-        return [int(row["id"]) for row in cur.fetchall()]
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id
+                FROM reminder_notifications
+                WHERE event_id = %s AND sent = 0
+                """,
+                (event_id,)
+            )
+            rows = cur.fetchall()
+            return [int(row["id"]) for row in rows]
     finally:
         conn.close()
 
@@ -851,42 +864,44 @@ def get_notification_ids_by_event(event_id: int) -> List[int]:
 def is_notification_active(notification_id: int) -> bool:
     conn = get_conn()
     try:
-        cur = conn.execute(
-            """
-            SELECT rn.sent, rn.canceled, re.canceled AS event_canceled
-            FROM reminder_notifications rn
-            JOIN reminder_events re ON rn.event_id = re.id
-            WHERE rn.id = ?
-            """,
-            (notification_id,)
-        )
-        row = cur.fetchone()
-        if not row:
-            return False
-        return (
-            int(row["sent"]) == 0
-            and int(row["canceled"]) == 0
-            and int(row["event_canceled"]) == 0
-        )
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT rn.sent, rn.canceled, re.canceled AS event_canceled
+                FROM reminder_notifications rn
+                JOIN reminder_events re ON rn.event_id = re.id
+                WHERE rn.id = %s
+                """,
+                (notification_id,)
+            )
+            row = cur.fetchone()
+            if not row:
+                return False
+            return (
+                int(row["sent"]) == 0
+                and int(row["canceled"]) == 0
+                and int(row["event_canceled"]) == 0
+            )
     finally:
         conn.close()
 
 
-def find_duplicate_event(chat_id: int, event_time: datetime, message: str) -> Optional[sqlite3.Row]:
+def find_duplicate_event(chat_id: int, event_time: datetime, message: str) -> Optional[Dict[str, Any]]:
     conn = get_conn()
     try:
-        cur = conn.execute(
-            """
-            SELECT id, event_time, message, keyword
-            FROM reminder_events
-            WHERE chat_id = ?
-              AND event_time = ?
-              AND canceled = 0
-            ORDER BY id DESC
-            """,
-            (chat_id, event_time.isoformat())
-        )
-        rows = cur.fetchall()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, event_time, message, keyword
+                FROM reminder_events
+                WHERE chat_id = %s
+                  AND event_time = %s
+                  AND canceled = 0
+                ORDER BY id DESC
+                """,
+                (chat_id, event_time)
+            )
+            rows = cur.fetchall()
 
         target_message = normalize_message_for_compare(message)
         for row in rows:
@@ -901,47 +916,51 @@ def save_event_with_notifications(chat_id: int, event_time: datetime, message: s
     conn = get_conn()
     try:
         keyword = normalize_keyword_for_event(message)
-        now_iso = datetime.now(TZINFO).isoformat()
+        now_dt = datetime.now(TZINFO)
 
-        cur = conn.execute(
-            """
-            INSERT INTO reminder_events (chat_id, event_time, message, keyword, canceled, created_at)
-            VALUES (?, ?, ?, ?, 0, ?)
-            """,
-            (chat_id, event_time.isoformat(), message, keyword, now_iso)
-        )
-        event_id = int(cur.lastrowid)
-
-        notifications = []
-        for notify_type, label, delta in ADVANCE_REMINDER_RULES:
-            notify_time = event_time - delta if delta.total_seconds() > 0 else event_time
-
-            if notify_time <= datetime.now(TZINFO) and notify_type != "event":
-                continue
-
-            cur2 = conn.execute(
+        with conn.cursor() as cur:
+            cur.execute(
                 """
-                INSERT INTO reminder_notifications
-                (event_id, chat_id, notify_time, notify_type, label, sent, canceled, created_at)
-                VALUES (?, ?, ?, ?, ?, 0, 0, ?)
+                INSERT INTO reminder_events (chat_id, event_time, message, keyword, canceled, created_at)
+                VALUES (%s, %s, %s, %s, 0, %s)
+                RETURNING id
                 """,
-                (
-                    event_id,
-                    chat_id,
-                    notify_time.isoformat(),
-                    notify_type,
-                    label,
-                    now_iso,
+                (chat_id, event_time, message, keyword, now_dt)
+            )
+            event_id = int(cur.fetchone()["id"])
+
+            notifications = []
+            for notify_type, label, delta in ADVANCE_REMINDER_RULES:
+                notify_time = event_time - delta if delta.total_seconds() > 0 else event_time
+
+                if notify_time <= datetime.now(TZINFO) and notify_type != "event":
+                    continue
+
+                cur.execute(
+                    """
+                    INSERT INTO reminder_notifications
+                    (event_id, chat_id, notify_time, notify_type, label, sent, canceled, created_at)
+                    VALUES (%s, %s, %s, %s, %s, 0, 0, %s)
+                    RETURNING id
+                    """,
+                    (
+                        event_id,
+                        chat_id,
+                        notify_time,
+                        notify_type,
+                        label,
+                        now_dt,
+                    )
                 )
-            )
-            notifications.append(
-                {
-                    "notification_id": int(cur2.lastrowid),
-                    "notify_time": notify_time,
-                    "notify_type": notify_type,
-                    "label": label,
-                }
-            )
+                notification_id = int(cur.fetchone()["id"])
+                notifications.append(
+                    {
+                        "notification_id": notification_id,
+                        "notify_time": notify_time,
+                        "notify_type": notify_type,
+                        "label": label,
+                    }
+                )
 
         conn.commit()
         return {
@@ -955,73 +974,76 @@ def save_event_with_notifications(chat_id: int, event_time: datetime, message: s
         conn.close()
 
 
-def get_pending_notifications() -> List[sqlite3.Row]:
+def get_pending_notifications() -> List[Dict[str, Any]]:
     conn = get_conn()
     try:
-        cur = conn.execute(
-            """
-            SELECT
-                rn.id,
-                rn.event_id,
-                rn.chat_id,
-                rn.notify_time,
-                rn.notify_type,
-                rn.label,
-                re.event_time,
-                re.message
-            FROM reminder_notifications rn
-            JOIN reminder_events re ON rn.event_id = re.id
-            WHERE rn.sent = 0 AND rn.canceled = 0 AND re.canceled = 0
-            ORDER BY rn.notify_time ASC
-            """
-        )
-        return cur.fetchall()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    rn.id,
+                    rn.event_id,
+                    rn.chat_id,
+                    rn.notify_time,
+                    rn.notify_type,
+                    rn.label,
+                    re.event_time,
+                    re.message
+                FROM reminder_notifications rn
+                JOIN reminder_events re ON rn.event_id = re.id
+                WHERE rn.sent = 0 AND rn.canceled = 0 AND re.canceled = 0
+                ORDER BY rn.notify_time ASC
+                """
+            )
+            return cur.fetchall()
     finally:
         conn.close()
 
 
-def get_due_unsent_notifications() -> List[sqlite3.Row]:
+def get_due_unsent_notifications() -> List[Dict[str, Any]]:
     conn = get_conn()
     try:
-        cur = conn.execute(
-            """
-            SELECT
-                rn.id,
-                rn.event_id,
-                rn.chat_id,
-                rn.notify_time,
-                rn.notify_type,
-                rn.label,
-                re.event_time,
-                re.message
-            FROM reminder_notifications rn
-            JOIN reminder_events re ON rn.event_id = re.id
-            WHERE rn.sent = 0
-              AND rn.canceled = 0
-              AND re.canceled = 0
-              AND rn.notify_time <= ?
-            ORDER BY rn.notify_time ASC
-            """,
-            (datetime.now(TZINFO).isoformat(),)
-        )
-        return cur.fetchall()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    rn.id,
+                    rn.event_id,
+                    rn.chat_id,
+                    rn.notify_time,
+                    rn.notify_type,
+                    rn.label,
+                    re.event_time,
+                    re.message
+                FROM reminder_notifications rn
+                JOIN reminder_events re ON rn.event_id = re.id
+                WHERE rn.sent = 0
+                  AND rn.canceled = 0
+                  AND re.canceled = 0
+                  AND rn.notify_time <= %s
+                ORDER BY rn.notify_time ASC
+                """,
+                (datetime.now(TZINFO),)
+            )
+            return cur.fetchall()
     finally:
         conn.close()
 
 
-def get_user_pending_events(chat_id: int) -> List[sqlite3.Row]:
+def get_user_pending_events(chat_id: int) -> List[Dict[str, Any]]:
     conn = get_conn()
     try:
-        cur = conn.execute(
-            """
-            SELECT id, event_time, message, keyword
-            FROM reminder_events
-            WHERE chat_id = ? AND canceled = 0
-            ORDER BY event_time ASC
-            """,
-            (chat_id,)
-        )
-        return cur.fetchall()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, event_time, message, keyword
+                FROM reminder_events
+                WHERE chat_id = %s AND canceled = 0
+                ORDER BY event_time ASC
+                """,
+                (chat_id,)
+            )
+            return cur.fetchall()
     finally:
         conn.close()
 
@@ -1029,10 +1051,11 @@ def get_user_pending_events(chat_id: int) -> List[sqlite3.Row]:
 def mark_notification_sent(notification_id: int) -> None:
     conn = get_conn()
     try:
-        conn.execute(
-            "UPDATE reminder_notifications SET sent = 1 WHERE id = ?",
-            (notification_id,)
-        )
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE reminder_notifications SET sent = 1 WHERE id = %s",
+                (notification_id,)
+            )
         conn.commit()
     finally:
         conn.close()
@@ -1041,51 +1064,56 @@ def mark_notification_sent(notification_id: int) -> None:
 def cancel_event_by_id(event_id: int, chat_id: int) -> bool:
     conn = get_conn()
     try:
-        cur = conn.execute(
-            """
-            UPDATE reminder_events
-            SET canceled = 1
-            WHERE id = ? AND chat_id = ? AND canceled = 0
-            """,
-            (event_id, chat_id)
-        )
-        if cur.rowcount <= 0:
-            conn.commit()
-            return False
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE reminder_events
+                SET canceled = 1
+                WHERE id = %s AND chat_id = %s AND canceled = 0
+                """,
+                (event_id, chat_id)
+            )
+            rowcount = cur.rowcount
 
-        conn.execute(
-            """
-            UPDATE reminder_notifications
-            SET canceled = 1
-            WHERE event_id = ?
-            """,
-            (event_id,)
-        )
+            if rowcount <= 0:
+                conn.commit()
+                return False
+
+            cur.execute(
+                """
+                UPDATE reminder_notifications
+                SET canceled = 1
+                WHERE event_id = %s
+                """,
+                (event_id,)
+            )
+
         conn.commit()
         return True
     finally:
         conn.close()
 
 
-def find_latest_event_by_keyword(chat_id: int, keyword: str) -> Optional[sqlite3.Row]:
+def find_latest_event_by_keyword(chat_id: int, keyword: str) -> Optional[Dict[str, Any]]:
     conn = get_conn()
     try:
-        cur = conn.execute(
-            """
-            SELECT id, event_time, message, keyword
-            FROM reminder_events
-            WHERE chat_id = ?
-              AND canceled = 0
-              AND (
-                    lower(message) LIKE ?
-                    OR lower(keyword) LIKE ?
-                  )
-            ORDER BY event_time DESC
-            LIMIT 1
-            """,
-            (chat_id, f"%{keyword.lower()}%", f"%{keyword.lower()}%")
-        )
-        return cur.fetchone()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, event_time, message, keyword
+                FROM reminder_events
+                WHERE chat_id = %s
+                  AND canceled = 0
+                  AND (
+                        lower(message) LIKE %s
+                        OR lower(keyword) LIKE %s
+                      )
+                ORDER BY event_time DESC
+                LIMIT 1
+                """,
+                (chat_id, f"%{keyword.lower()}%", f"%{keyword.lower()}%")
+            )
+            return cur.fetchone()
     finally:
         conn.close()
 
@@ -1182,10 +1210,7 @@ def catch_up_missed_notifications() -> None:
                 logger.info("Skip inactive catch-up notification id=%s", notification_id)
                 continue
 
-            event_time = datetime.fromisoformat(row["event_time"])
-            if event_time.tzinfo is None:
-                event_time = event_time.replace(tzinfo=TZINFO)
-
+            event_time = parse_db_datetime(row["event_time"])
             label = row["label"]
             message = row["message"]
 
@@ -1215,13 +1240,8 @@ def load_pending_notifications_into_scheduler() -> None:
         event_id = int(row["event_id"])
         chat_id = int(row["chat_id"])
 
-        notify_time = datetime.fromisoformat(row["notify_time"])
-        if notify_time.tzinfo is None:
-            notify_time = notify_time.replace(tzinfo=TZINFO)
-
-        event_time = datetime.fromisoformat(row["event_time"])
-        if event_time.tzinfo is None:
-            event_time = event_time.replace(tzinfo=TZINFO)
+        notify_time = parse_db_datetime(row["notify_time"])
+        event_time = parse_db_datetime(row["event_time"])
 
         label = row["label"]
         message = row["message"]
@@ -1342,10 +1362,7 @@ def handle_list(chat_id: int) -> None:
 
     lines = ["📌 目前所有未取消提醒", ""]
     for row in rows[:50]:
-        event_time = datetime.fromisoformat(row["event_time"])
-        if event_time.tzinfo is None:
-            event_time = event_time.replace(tzinfo=TZINFO)
-
+        event_time = parse_db_datetime(row["event_time"])
         lines.append(
             f"事件代碼：{row['id']}\n"
             f"{event_time.strftime('%Y-%m-%d %H:%M')}｜{row['message']}"
@@ -1386,9 +1403,7 @@ def handle_cancel_by_keyword(chat_id: int, text: str) -> bool:
         return True
 
     event_id = int(row["id"])
-    event_time = datetime.fromisoformat(row["event_time"])
-    if event_time.tzinfo is None:
-        event_time = event_time.replace(tzinfo=TZINFO)
+    event_time = parse_db_datetime(row["event_time"])
 
     remove_scheduled_jobs_for_event(event_id)
     ok = cancel_event_by_id(event_id, chat_id)
