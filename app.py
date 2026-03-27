@@ -39,10 +39,13 @@ from telegram_api import send_message
 # 基本設定
 # =========================
 HTTP_TIMEOUT = 20
-SUMMARY_ONLY_FOR_DAILY_PUSH = os.getenv("SUMMARY_ONLY_FOR_DAILY_PUSH", "true").strip().lower() == "true"
 
 DATA_DIR = os.getenv("DATA_DIR", os.path.dirname(DB_PATH) or ".").strip()
 CHAT_FILE = os.path.join(DATA_DIR, "chat_ids.json")
+
+CWA_API_KEY = os.getenv("CWA_API_KEY", "").strip()
+DEFAULT_WEATHER_CITY = os.getenv("DEFAULT_WEATHER_CITY", "臺中市").strip()
+WEATHER_PUSH_TIME = os.getenv("WEATHER_PUSH_TIME", "").strip()
 
 if not BOT_TOKEN:
     raise RuntimeError("Missing BOT_TOKEN in environment variables.")
@@ -68,9 +71,11 @@ RSS_FEEDS = {
     "tech": [
         "https://news.google.com/rss/headlines/section/topic/TECHNOLOGY?hl=en-US&gl=US&ceid=US:en",
         "https://feeds.npr.org/1019/rss.xml",
+        "https://news.google.com/rss/search?q=AI+OR+artificial+intelligence+OR+OpenAI+OR+NVIDIA+OR+Google+DeepMind&hl=en-US&gl=US&ceid=US:en",
     ],
     "business": [
         "https://news.google.com/rss/headlines/section/topic/BUSINESS?hl=en-US&gl=US&ceid=US:en",
+        "https://news.google.com/rss/search?q=finance+OR+stock+OR+market+OR+economy+OR+earnings+OR+Federal+Reserve&hl=en-US&gl=US&ceid=US:en",
     ],
 }
 
@@ -122,7 +127,6 @@ def get_all_target_chat_ids() -> List[int]:
         ids.append(OWNER_ID)
 
     ids.extend(load_chat_ids())
-
     return sorted(list(set(ids)))
 
 
@@ -165,7 +169,7 @@ def clean_html_text(raw: str) -> str:
 
 
 def trim_text(text: str, max_len: int = 110) -> str:
-    text = text.strip()
+    text = (text or "").strip()
     if len(text) <= max_len:
         return text
     return text[: max_len - 1].rstrip() + "…"
@@ -235,14 +239,14 @@ def summarize_to_chinese(title: str, raw_summary: str, source_name: str) -> str:
 
     try:
         prompt = f"""
-請將以下科技或商業新聞整理成繁體中文摘要。
+請將以下科技、AI、商業或財經新聞整理成繁體中文摘要。
 
 要求：
 1. 使用繁體中文
 2. 30~60字左右
 3. 精簡、自然、像新聞快報
 4. 不要加入未提供的推測
-5. 優先保留公司、產品、商業/科技重點
+5. 優先保留公司、產品、產業與商業重點
 6. 只輸出摘要，不要加「摘要：」
 
 新聞標題：
@@ -260,7 +264,7 @@ def summarize_to_chinese(title: str, raw_summary: str, source_name: str) -> str:
             messages=[
                 {
                     "role": "system",
-                    "content": "你是擅長整理國際科技與商業新聞的繁體中文編輯，輸出精簡、清楚、自然。"
+                    "content": "你是擅長整理國際科技、AI、商業與財經新聞的繁體中文編輯，輸出精簡、清楚、自然。"
                 },
                 {
                     "role": "user",
@@ -417,11 +421,11 @@ def format_news_message(
     now_str = datetime.now(TZINFO).strftime("%Y-%m-%d %H:%M")
 
     if category == "tech":
-        title = "🧠 今日科技新聞"
+        title = "🧠 今日科技 / AI 新聞"
     elif category == "business":
-        title = "💼 今日商業新聞"
+        title = "💼 今日商業 / 財經新聞"
     else:
-        title = "🗞️ 今日科技 / 商業新聞"
+        title = "🗞️ 今日科技 / AI / 商業 / 財經新聞"
 
     if not items:
         return (
@@ -437,9 +441,7 @@ def format_news_message(
     ]
 
     for idx, item in enumerate(items, start=1):
-        block = [
-            f"{idx}. {item['title']}",
-        ]
+        block = [f"{idx}. {item['title']}"]
 
         if include_summary:
             summary_value = item.get("summary") or item.get("raw_summary") or ""
@@ -467,9 +469,9 @@ def parse_news_command(text: str) -> Dict[str, Any]:
 
     if len(parts) >= 2:
         arg1 = parts[1].lower()
-        if arg1 in ("tech", "technology", "科技"):
+        if arg1 in ("tech", "technology", "ai", "科技"):
             category = "tech"
-        elif arg1 in ("business", "biz", "商業", "商務"):
+        elif arg1 in ("business", "biz", "finance", "財經", "商業", "商務"):
             category = "business"
         elif arg1 in ("all", "全部"):
             category = "all"
@@ -485,12 +487,140 @@ def parse_news_command(text: str) -> Dict[str, Any]:
 
 
 # =========================
+# 天氣功能
+# =========================
+def fetch_weather(city: str = DEFAULT_WEATHER_CITY) -> Optional[Dict[str, Any]]:
+    if not CWA_API_KEY:
+        logger.warning("CWA_API_KEY not set.")
+        return None
+
+    url = "https://opendata.cwa.gov.tw/api/v1/rest/datastore/F-C0032-001"
+    params = {
+        "Authorization": CWA_API_KEY,
+        "format": "JSON",
+        "locationName": city,
+    }
+
+    try:
+        r = requests.get(url, params=params, timeout=HTTP_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+
+        locations = data.get("records", {}).get("location", [])
+        if not locations:
+            return None
+
+        loc = locations[0]
+        weather_elements = {item["elementName"]: item["time"] for item in loc.get("weatherElement", [])}
+
+        wx_list = weather_elements.get("Wx", [])
+        pop_list = weather_elements.get("PoP", [])
+        min_list = weather_elements.get("MinT", [])
+        max_list = weather_elements.get("MaxT", [])
+        ci_list = weather_elements.get("CI", [])
+
+        if not wx_list:
+            return None
+
+        return {
+            "city": loc.get("locationName", city),
+            "start": wx_list[0].get("startTime", ""),
+            "end": wx_list[0].get("endTime", ""),
+            "weather": wx_list[0].get("parameter", {}).get("parameterName", ""),
+            "pop": pop_list[0].get("parameter", {}).get("parameterName", "") if pop_list else "",
+            "min_temp": min_list[0].get("parameter", {}).get("parameterName", "") if min_list else "",
+            "max_temp": max_list[0].get("parameter", {}).get("parameterName", "") if max_list else "",
+            "comfort": ci_list[0].get("parameter", {}).get("parameterName", "") if ci_list else "",
+        }
+
+    except Exception as e:
+        logger.exception("Weather fetch failed: %s", e)
+        return None
+
+
+def format_weather_message(weather: Optional[Dict[str, Any]]) -> str:
+    if not weather:
+        if not CWA_API_KEY:
+            return "目前尚未設定 CWA_API_KEY，無法取得天氣。"
+        return "天氣資料取得失敗，請稍後再試。"
+
+    city = weather.get("city", DEFAULT_WEATHER_CITY)
+    weather_text = weather.get("weather", "")
+    pop = weather.get("pop", "")
+    min_temp = weather.get("min_temp", "")
+    max_temp = weather.get("max_temp", "")
+    comfort = weather.get("comfort", "")
+    start = weather.get("start", "")
+    end = weather.get("end", "")
+
+    tip = ""
+    try:
+        pop_value = int(pop)
+        if pop_value >= 50:
+            tip = "提醒：降雨機率偏高，建議帶傘。"
+        elif pop_value >= 20:
+            tip = "提醒：可能有局部降雨，外出可備傘。"
+        else:
+            tip = "提醒：降雨機率不高。"
+    except Exception:
+        pass
+
+    lines = [
+        f"🌤️ {city} 天氣預報",
+        f"時段：{start} ~ {end}",
+        f"天氣：{weather_text}",
+        f"溫度：{min_temp} ~ {max_temp}°C",
+        f"降雨機率：{pop}%",
+    ]
+
+    if comfort:
+        lines.append(f"體感：{comfort}")
+    if tip:
+        lines.append(tip)
+
+    return "\n".join(lines)
+
+
+def handle_weather(chat_id: int, text: str = "") -> None:
+    register_chat_id(chat_id)
+
+    city = DEFAULT_WEATHER_CITY
+    parts = text.strip().split(maxsplit=1)
+    if len(parts) >= 2 and parts[1].strip():
+        city = parts[1].strip()
+
+    weather = fetch_weather(city)
+    msg = format_weather_message(weather)
+    send_message(chat_id, msg)
+
+
+def send_daily_weather() -> None:
+    logger.info("Running scheduled daily weather push...")
+    chat_ids = get_all_target_chat_ids()
+
+    if not chat_ids:
+        logger.warning("No chat ids found. Skip daily weather push.")
+        return
+
+    try:
+        weather = fetch_weather(DEFAULT_WEATHER_CITY)
+        message = format_weather_message(weather)
+
+        for chat_id in chat_ids:
+            try:
+                send_message(chat_id, message)
+                logger.info("Daily weather sent to %s", chat_id)
+            except Exception as e:
+                logger.exception("Failed to send daily weather to %s: %s", chat_id, e)
+    except Exception as e:
+        logger.exception("Daily weather job failed: %s", e)
+
+
+# =========================
 # 提醒功能：事件型
 # =========================
 ADVANCE_REMINDER_RULES = [
-    ("2h", "- 2小時前", timedelta(hours=2)),
     ("1h", "- 1小時前", timedelta(hours=1)),
-    ("30m", "- 30分鐘前", timedelta(minutes=30)),
     ("event", "- 事件時間", timedelta(seconds=0)),
 ]
 
@@ -573,7 +703,6 @@ def replace_chinese_number_in_match(match: re.Match) -> str:
 def normalize_chinese_time_text(text: str) -> str:
     normalized = text.strip()
 
-    # 相對時間：三十分鐘後 / 兩小時後
     normalized = re.sub(
         r"([零〇○Ｏ一二兩三四五六七八九十\d]+)(?=\s*(分鐘|分|min|mins|minute|minutes|小時|hr|hrs|hour|hours)\s*後)",
         replace_chinese_number_in_match,
@@ -581,24 +710,18 @@ def normalize_chinese_time_text(text: str) -> str:
         flags=re.IGNORECASE,
     )
 
-    # 日期格式中的月日國字，像 3月二十七日 這種先不處理，避免過度影響其他內容
-    # 主要處理提醒時常見的 時 / 分
-
-    # 七點 / 十點 / 十二點
     normalized = re.sub(
         r"([零〇○Ｏ一二兩三四五六七八九十\d]+)(?=\s*點)",
         replace_chinese_number_in_match,
         normalized,
     )
 
-    # 十分 / 二十五分
     normalized = re.sub(
         r"([零〇○Ｏ一二兩三四五六七八九十\d]+)(?=\s*分)",
         replace_chinese_number_in_match,
         normalized,
     )
 
-    # 7:三十 / 7：三十
     normalized = re.sub(
         r"(?<=[:：])\s*([零〇○Ｏ一二兩三四五六七八九十\d]+)",
         replace_chinese_number_in_match,
@@ -919,9 +1042,15 @@ def notification_job_id(notification_id: int) -> str:
 
 
 def build_notification_text(label: str, event_time: datetime, message: str, event_id: int) -> str:
+    if label == "- 1小時前":
+        return (
+            "⏰ 提醒通知\n"
+            f"還有1小時：{event_time.strftime('%Y-%m-%d %H:%M')}｜{message}"
+        )
+
     return (
         "⏰ 提醒通知\n"
-        f"{event_time.strftime('%Y-%m-%d %H:%M')}｜{message}"
+        f"現在時間到：{event_time.strftime('%Y-%m-%d %H:%M')}｜{message}"
     )
 
 
@@ -1062,12 +1191,13 @@ def handle_start(chat_id: int) -> None:
         "/news\n"
         "/news tech\n"
         "/news business\n"
+        "/weather\n"
         "/list\n"
         "/cancel 事件代碼\n"
         "/help\n\n"
         "提醒可直接輸入：\n"
         "晚上7點半打球\n"
-        "今天早上七點吃肉粿\n"
+        "今天早上七點吃早餐\n"
         "明天晚上七點半打球\n"
         "2026-03-27 14:30 開會\n"
         "30分鐘後提醒我喝水\n"
@@ -1084,11 +1214,13 @@ def handle_help(chat_id: int) -> None:
         "/news\n"
         "/news tech\n"
         "/news business\n"
+        "/weather\n"
+        "/weather 臺北市\n"
         "/list\n"
         "/cancel 事件代碼\n\n"
         "提醒輸入範例：\n"
         "晚上7點半打球\n"
-        "今天早上七點吃肉粿\n"
+        "今天早上七點吃早餐\n"
         "明天晚上七點半打球\n"
         "30分鐘後提醒我喝水\n"
         "兩小時後提醒我洗衣服\n\n"
@@ -1104,12 +1236,10 @@ def handle_news(chat_id: int, text: str) -> None:
     args = parse_news_command(text)
     items = fetch_news(category=args["category"], limit=args["limit"])
 
-    if ENABLE_CHINESE_SUMMARY and not SUMMARY_ONLY_FOR_DAILY_PUSH:
+    if ENABLE_CHINESE_SUMMARY:
         items = enrich_news_with_chinese_summary(items)
-        msg = format_news_message(items, category=args["category"], include_summary=True)
-    else:
-        msg = format_news_message(items, category=args["category"], include_summary=False)
 
+    msg = format_news_message(items, category=args["category"], include_summary=True)
     send_message(chat_id, msg)
 
 
@@ -1119,8 +1249,8 @@ def handle_list(chat_id: int) -> None:
         send_message(chat_id, "目前沒有未取消事件提醒。")
         return
 
-    lines = ["📌 未取消事件提醒", ""]
-    for row in rows[:20]:
+    lines = ["📌 目前所有未取消提醒", ""]
+    for row in rows[:50]:
         event_time = datetime.fromisoformat(row["event_time"])
         if event_time.tzinfo is None:
             event_time = event_time.replace(tzinfo=TZINFO)
@@ -1221,6 +1351,7 @@ def try_handle_event_reminder(chat_id: int, text: str) -> bool:
         lines.append("已覆蓋先前相同提醒")
 
     lines.append(f"{event_time.strftime('%Y-%m-%d %H:%M')}｜{message}")
+    lines.append("提醒時間：前1小時、事件當下")
 
     send_message(chat_id, "\n".join(lines))
     return True
@@ -1234,11 +1365,17 @@ def handle_unknown(chat_id: int) -> None:
         "/news\n"
         "/news tech\n"
         "/news business\n"
+        "/weather\n"
         "/list\n"
         "/cancel 事件代碼\n\n"
+        "也可以直接輸入：\n"
+        "news\n"
+        "new\n"
+        "weather\n"
+        "天氣\n\n"
         "也可以直接輸入提醒，例如：\n"
         "晚上7點半打球\n"
-        "今天早上七點吃肉粿\n"
+        "今天早上七點吃早餐\n"
         "明天晚上七點半打球\n"
         "兩小時後提醒我喝水\n\n"
         "取消也可直接輸入：\n"
@@ -1274,6 +1411,31 @@ def schedule_jobs() -> None:
         misfire_grace_time=3600,
     )
 
+    if WEATHER_PUSH_TIME:
+        try:
+            scheduler.remove_job("daily_weather_job")
+        except JobLookupError:
+            pass
+        except Exception as e:
+            logger.exception("Failed removing old daily_weather_job: %s", e)
+
+        try:
+            w_hour, w_minute = WEATHER_PUSH_TIME.split(":")
+            scheduler.add_job(
+                send_daily_weather,
+                trigger="cron",
+                hour=int(w_hour),
+                minute=int(w_minute),
+                id="daily_weather_job",
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+                misfire_grace_time=3600,
+            )
+            logger.info("Daily weather scheduled at %s (%s)", WEATHER_PUSH_TIME, TIMEZONE)
+        except Exception as e:
+            logger.exception("Failed scheduling daily weather: %s", e)
+
     logger.info("Scheduler started. Daily news at %s (%s)", NEWS_PUSH_TIME, TIMEZONE)
 
 
@@ -1288,10 +1450,12 @@ def home():
             "service": "telegram-bot-private-news-reminder",
             "timezone": TIMEZONE,
             "news_push_time": NEWS_PUSH_TIME,
+            "weather_push_time": WEATHER_PUSH_TIME,
             "owner_id_set": bool(OWNER_ID),
             "openai_model": OPENAI_MODEL,
             "chinese_summary_enabled": ENABLE_CHINESE_SUMMARY,
-            "summary_only_for_daily_push": SUMMARY_ONLY_FOR_DAILY_PUSH,
+            "weather_city": DEFAULT_WEATHER_CITY,
+            "weather_enabled": bool(CWA_API_KEY),
         }
     )
 
@@ -1322,12 +1486,18 @@ def telegram_webhook():
 
         logger.info("Incoming message from %s: %s", chat_id, text)
 
+        lowered = text.lower().strip()
+
         if text.startswith("/start"):
             handle_start(chat_id)
         elif text.startswith("/help"):
             handle_help(chat_id)
-        elif text.startswith("/news"):
-            handle_news(chat_id, text)
+        elif text.startswith("/news") or lowered in ("news", "new"):
+            normalized_text = text if text.startswith("/news") else "/news"
+            handle_news(chat_id, normalized_text)
+        elif text.startswith("/weather") or lowered in ("weather", "天氣"):
+            normalized_text = text if text.startswith("/weather") else "/weather"
+            handle_weather(chat_id, normalized_text)
         elif text.startswith("/list"):
             handle_list(chat_id)
         elif text.startswith("/cancel"):
