@@ -884,6 +884,84 @@ def get_user_pending_events(chat_id: int) -> List[Dict[str, Any]]:
         conn.close()
 
 
+def event_has_pending_notifications(event_id: int) -> bool:
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT 1
+                FROM reminder_notifications
+                WHERE event_id = %s
+                  AND canceled = 0
+                  AND sent = 0
+                LIMIT 1
+                """,
+                (event_id,)
+            )
+            return cur.fetchone() is not None
+    finally:
+        conn.close()
+
+
+def cleanup_completed_event(event_id: int) -> None:
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT 1
+                FROM reminder_notifications
+                WHERE event_id = %s
+                  AND canceled = 0
+                  AND sent = 0
+                LIMIT 1
+                """,
+                (event_id,)
+            )
+            still_pending = cur.fetchone() is not None
+            if still_pending:
+                conn.commit()
+                return
+
+            cur.execute(
+                "DELETE FROM reminder_notifications WHERE event_id = %s",
+                (event_id,)
+            )
+            cur.execute(
+                "DELETE FROM reminder_events WHERE id = %s",
+                (event_id,)
+            )
+
+        conn.commit()
+        logger.info("Cleaned up completed event: event_id=%s", event_id)
+    finally:
+        conn.close()
+
+
+def cleanup_all_completed_events() -> None:
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT re.id
+                FROM reminder_events re
+                LEFT JOIN reminder_notifications rn
+                  ON rn.event_id = re.id
+                 AND rn.canceled = 0
+                 AND rn.sent = 0
+                WHERE rn.id IS NULL
+                """
+            )
+            rows = cur.fetchall()
+
+        for row in rows:
+            cleanup_completed_event(int(row["id"]))
+    finally:
+        conn.close()
+
+
 def mark_notification_sent(notification_id: int) -> None:
     conn = get_conn()
     try:
@@ -923,6 +1001,7 @@ def cancel_event_by_id(event_id: int, chat_id: int) -> bool:
             )
 
         conn.commit()
+        cleanup_completed_event(event_id)
         return True
     finally:
         conn.close()
@@ -980,6 +1059,7 @@ def schedule_one_notification(
                 return
             send_message(chat_id, build_notification_text(label, event_time, message, event_id))
             mark_notification_sent(notification_id)
+            cleanup_completed_event(event_id)
             logger.info("Notification sent: id=%s event_id=%s", notification_id, event_id)
         except Exception as e:
             logger.exception("Failed to send notification id=%s: %s", notification_id, e)
@@ -1016,6 +1096,7 @@ def catch_up_missed_notifications() -> None:
     try:
         rows = get_due_unsent_notifications()
         if not rows:
+            cleanup_all_completed_events()
             return
 
         logger.info("Catch-up scan found %s due unsent notifications", len(rows))
@@ -1035,6 +1116,7 @@ def catch_up_missed_notifications() -> None:
 
             send_message(chat_id, build_notification_text(label, event_time, message, event_id))
             mark_notification_sent(notification_id)
+            cleanup_completed_event(event_id)
 
             try:
                 scheduler.remove_job(notification_job_id(notification_id))
@@ -1044,6 +1126,8 @@ def catch_up_missed_notifications() -> None:
                 logger.exception("Failed removing catch-up job id=%s: %s", notification_id, e)
 
             logger.info("Catch-up notification sent: id=%s event_id=%s", notification_id, event_id)
+
+        cleanup_all_completed_events()
     except Exception as e:
         logger.exception("Catch-up missed notifications failed: %s", e)
 
@@ -1381,6 +1465,7 @@ def bootstrap() -> None:
         schedule_jobs()
         load_pending_notifications_into_scheduler()
         catch_up_missed_notifications()
+        cleanup_all_completed_events()
     except Exception as e:
         logger.exception("scheduler bootstrap failed: %s", e)
 
