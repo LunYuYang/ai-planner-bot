@@ -168,21 +168,4 @@ def init_db():
                     """
                 )
 
-            cur.execute(
-                """
-                SELECT indexname
-                FROM pg_indexes
-                WHERE tablename = 'reminder_notifications'
-                """
-            )
-            existing_indexes = {row["indexname"] for row in cur.fetchall()}
-
-            if "uq_reminder_notifications_event_offset" not in existing_indexes:
-                cur.execute(
-                    """
-                    CREATE UNIQUE INDEX IF NOT EXISTS uq_reminder_notifications_event_offset
-                    ON reminder_notifications (event_id, offset_seconds)
-                    """
-                )
-
         conn.commit()
