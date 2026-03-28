@@ -4,6 +4,7 @@ from contextlib import contextmanager
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
+
 DB_PATH = os.getenv("DB_PATH", "").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
@@ -107,6 +108,13 @@ def init_db():
                 """
                 CREATE INDEX IF NOT EXISTS idx_reminder_notifications_sent
                 ON reminder_notifications (sent)
+                """
+            )
+
+            cur.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_reminder_notifications_event_offset
+                ON reminder_notifications (event_id, offset_seconds)
                 """
             )
 
