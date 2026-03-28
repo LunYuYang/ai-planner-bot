@@ -68,8 +68,8 @@ def init_db():
                 CREATE TABLE IF NOT EXISTS reminder_notifications (
                     id SERIAL PRIMARY KEY,
                     event_id INTEGER NOT NULL REFERENCES reminder_events(id) ON DELETE CASCADE,
-                    notify_at TIMESTAMP NOT NULL,
-                    offset_seconds INTEGER NOT NULL,
+                    notify_at TIMESTAMP NULL,
+                    offset_seconds INTEGER NOT NULL DEFAULT 0,
                     sent BOOLEAN NOT NULL DEFAULT FALSE,
                     created_at TIMESTAMP NOT NULL DEFAULT NOW()
                 )
@@ -129,7 +129,10 @@ def init_db():
 
             if "completed_at" not in event_columns:
                 cur.execute(
-                    "ALTER TABLE reminder_events ADD COLUMN completed_at TIMESTAMP NULL"
+                    """
+                    ALTER TABLE reminder_events
+                    ADD COLUMN completed_at TIMESTAMP NULL
+                    """
                 )
 
             cur.execute(
@@ -141,11 +144,44 @@ def init_db():
             )
             notification_columns = {row["column_name"] for row in cur.fetchall()}
 
+            if "notify_at" not in notification_columns:
+                cur.execute(
+                    """
+                    ALTER TABLE reminder_notifications
+                    ADD COLUMN notify_at TIMESTAMP NULL
+                    """
+                )
+
+            if "offset_seconds" not in notification_columns:
+                cur.execute(
+                    """
+                    ALTER TABLE reminder_notifications
+                    ADD COLUMN offset_seconds INTEGER NOT NULL DEFAULT 0
+                    """
+                )
+
             if "sent" not in notification_columns:
                 cur.execute(
                     """
                     ALTER TABLE reminder_notifications
                     ADD COLUMN sent BOOLEAN NOT NULL DEFAULT FALSE
+                    """
+                )
+
+            cur.execute(
+                """
+                SELECT indexname
+                FROM pg_indexes
+                WHERE tablename = 'reminder_notifications'
+                """
+            )
+            existing_indexes = {row["indexname"] for row in cur.fetchall()}
+
+            if "uq_reminder_notifications_event_offset" not in existing_indexes:
+                cur.execute(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS uq_reminder_notifications_event_offset
+                    ON reminder_notifications (event_id, offset_seconds)
                     """
                 )
 
