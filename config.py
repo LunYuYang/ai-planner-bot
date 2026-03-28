@@ -27,7 +27,6 @@ TIMEZONE = _getenv_str("TIMEZONE", "Asia/Taipei")
 RENDER_EXTERNAL_URL = _getenv_str("RENDER_EXTERNAL_URL")
 WEBHOOK_SECRET_PATH = _getenv_str("WEBHOOK_SECRET_PATH", "webhook")
 
-# PostgreSQL 版主要吃 DATABASE_URL；DB_PATH 只作 fallback 保留
 DB_PATH = _getenv_str("DB_PATH", "")
 
 DEFAULT_NEWS_CATEGORY = _getenv_str("DEFAULT_NEWS_CATEGORY", "business")
