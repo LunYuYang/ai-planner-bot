@@ -4,6 +4,10 @@ from psycopg2.extras import RealDictCursor
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
+if not DATABASE_URL:
+    raise RuntimeError("Missing DATABASE_URL in environment variables.")
+
+
 def get_conn():
     return psycopg2.connect(
         DATABASE_URL,
@@ -15,7 +19,6 @@ def init_db():
     conn = get_conn()
     try:
         with conn.cursor() as cur:
-
             cur.execute("""
             CREATE TABLE IF NOT EXISTS reminder_events (
                 id SERIAL PRIMARY KEY,
