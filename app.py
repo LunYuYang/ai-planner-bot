@@ -1218,14 +1218,6 @@ def handle_start(chat_id: int) -> None:
         "/cancel 事件代碼\n"
         "/cancel_all\n"
         "/help\n\n"
-        "提醒可直接輸入：\n"
-        "晚上7點半打球\n"
-        "今天早上七點吃早餐\n"
-        "明天晚上七點半打球\n"
-        "2026-03-27 14:30 開會\n"
-        "30分鐘後提醒我喝水\n"
-        "兩小時後提醒我洗衣服\n\n"
-        "多筆提醒可一行一筆輸入。"
     )
     send_message(chat_id, msg)
 
