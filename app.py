@@ -4,7 +4,7 @@ import json
 import html
 import logging
 from datetime import datetime, timedelta
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
 
 import requests
 import feedparser
@@ -58,17 +58,6 @@ TZINFO = ZoneInfo(TIMEZONE)
 app = Flask(__name__)
 scheduler = BackgroundScheduler(timezone=TZINFO)
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-
-
-def row_get(row: Any, key: str, index: int = 0, default: Any = None) -> Any:
-    if row is None:
-        return default
-    if isinstance(row, dict):
-        return row.get(key, default)
-    try:
-        return row[index]
-    except Exception:
-        return default
 
 
 def parse_db_datetime(value: Any) -> datetime:
@@ -250,10 +239,7 @@ def summarize_to_chinese(title: str, raw_summary: str, source_name: str) -> str:
         resp = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[
-                {
-                    "role": "system",
-                    "content": "你是擅長整理國際科技、AI、商業與財經新聞的繁體中文編輯，輸出精簡、清楚、自然。",
-                },
+                {"role": "system", "content": "你是擅長整理國際科技、AI、商業與財經新聞的繁體中文編輯，輸出精簡、清楚、自然。"},
                 {"role": "user", "content": prompt},
             ],
             temperature=0.3,
@@ -274,1287 +260,1131 @@ def fetch_rss_items(feed_url: str, category: str) -> List[Dict[str, Any]]:
     feed_title = clean_html_text(parsed.feed.get("title", ""))
 
     items: List[Dict[str, Any]] = []
-    for entry in parsed.entries[:20]:
-        title = clean_html_text(entry.get("title", ""))
-        link = entry.get("link", "")
-        if not title or not link:
+    for entry in parsed.entries:
+        title_raw = clean_html_text(entry.get("title", "")).strip()
+        if not title_raw:
             continue
-
-        source_name = extract_source_name(feed_title, entry)
-        raw_summary = build_raw_summary(entry, source_name)
-        zh_summary = summarize_to_chinese(title, raw_summary, source_name)
 
         items.append(
             {
-                "category": category,
-                "title": title,
-                "link": link,
-                "source": source_name,
-                "summary": zh_summary,
+                "title": title_raw,
+                "title_norm": normalize_title(title_raw),
+                "link": entry.get("link", "").strip(),
+                "raw_summary": build_raw_summary(entry, extract_source_name(feed_title, entry)),
+                "source": extract_source_name(feed_title, entry),
                 "published_ts": parse_published_ts(entry),
+                "category": category,
             }
         )
     return items
 
 
-def dedupe_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    best_map: Dict[str, Dict[str, Any]] = {}
+def fetch_news(category: str = "all", limit: int = DEFAULT_NEWS_LIMIT) -> List[Dict[str, Any]]:
+    if category == "all":
+        selected_categories = ["tech", "business"]
+    elif category in ("tech", "business"):
+        selected_categories = [category]
+    else:
+        selected_categories = ["tech", "business"]
+
+    all_items: List[Dict[str, Any]] = []
+    seen_titles = set()
+    seen_links = set()
+
+    ordered_categories = sorted(selected_categories, key=lambda x: 0 if x == "tech" else 1)
+
+    for cat in ordered_categories:
+        for feed_url in RSS_FEEDS.get(cat, []):
+            try:
+                items = fetch_rss_items(feed_url, cat)
+                for item in items:
+                    title_key = item["title_norm"]
+                    link_key = item["link"].strip().lower()
+                    if title_key in seen_titles:
+                        continue
+                    if link_key and link_key in seen_links:
+                        continue
+                    seen_titles.add(title_key)
+                    if link_key:
+                        seen_links.add(link_key)
+                    all_items.append(item)
+            except Exception as e:
+                logger.exception("Failed to parse feed %s: %s", feed_url, e)
+
+    all_items.sort(key=lambda x: x.get("published_ts", 0), reverse=True)
+
+    if category == "all":
+        tech_items = [x for x in all_items if x["category"] == "tech"]
+        biz_items = [x for x in all_items if x["category"] == "business"]
+
+        mixed: List[Dict[str, Any]] = []
+        mixed.extend(tech_items[: min(3, len(tech_items))])
+
+        remaining = limit - len(mixed)
+        if remaining > 0:
+            mixed.extend(biz_items[:remaining])
+
+        remaining = limit - len(mixed)
+        if remaining > 0:
+            used = {x["title_norm"] for x in mixed}
+            for item in tech_items[3:]:
+                if item["title_norm"] not in used:
+                    mixed.append(item)
+                    used.add(item["title_norm"])
+                if len(mixed) >= limit:
+                    break
+
+        if len(mixed) < limit:
+            used = {x["title_norm"] for x in mixed}
+            for item in biz_items:
+                if item["title_norm"] not in used:
+                    mixed.append(item)
+                    used.add(item["title_norm"])
+                if len(mixed) >= limit:
+                    break
+
+        return mixed[:limit]
+
+    return all_items[:limit]
+
+
+def enrich_news_with_chinese_summary(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    enriched: List[Dict[str, Any]] = []
     for item in items:
-        key = normalize_title(item["title"])
-        current = best_map.get(key)
-        if not current or item["published_ts"] > current["published_ts"]:
-            best_map[key] = item
-    return list(best_map.values())
+        new_item = dict(item)
+        new_item["summary"] = summarize_to_chinese(
+            title=item["title"],
+            raw_summary=item["raw_summary"],
+            source_name=item["source"],
+        )
+        enriched.append(new_item)
+    return enriched
 
 
-def get_news(category: str, limit: int) -> List[Dict[str, Any]]:
-    category = (category or DEFAULT_NEWS_CATEGORY).lower().strip()
-    if category not in RSS_FEEDS:
-        category = DEFAULT_NEWS_CATEGORY
+def format_news_message(items: List[Dict[str, Any]], category: str = "all", include_summary: bool = True) -> str:
+    now_str = datetime.now(TZINFO).strftime("%Y-%m-%d %H:%M")
 
-    collected: List[Dict[str, Any]] = []
-    for feed_url in RSS_FEEDS[category]:
-        try:
-            collected.extend(fetch_rss_items(feed_url, category))
-        except Exception as e:
-            logger.exception("Fetch RSS failed (%s): %s", feed_url, e)
+    if category == "tech":
+        title = "🧠 今日科技 / AI 新聞"
+    elif category == "business":
+        title = "💼 今日商業 / 財經新聞"
+    else:
+        title = "🗞️ 今日科技 / AI / 商業 / 財經新聞"
 
-    deduped = dedupe_items(collected)
-    deduped.sort(key=lambda x: x.get("published_ts", 0), reverse=True)
-    return deduped[:limit]
-
-
-def format_news_message(items: List[Dict[str, Any]], title: str = "今日新聞") -> str:
     if not items:
-        return f"{title}\n\n目前抓不到新聞，請稍後再試。"
+        return f"{title}\n更新時間：{now_str}\n\n目前抓不到新聞，請稍後再試。"
 
-    lines = [title, ""]
+    lines = [title, f"更新時間：{now_str}", ""]
+
     for idx, item in enumerate(items, start=1):
-        lines.append(f"{idx}. {item['title']}")
-        lines.append(f"來源：{item['source']}")
-        lines.append(f"重點：{item['summary']}")
-        lines.append(item["link"])
+        block = [f"{idx}. {item['title']}"]
+        if include_summary:
+            block.append(f"摘要：{item.get('summary') or item.get('raw_summary') or ''}")
+        block.append(f"來源：{item['source']}")
+        if item["link"]:
+            block.append(item["link"])
+        lines.append("\n".join(block))
         lines.append("")
-    return "\n".join(lines).strip()
+
+    message = "\n".join(lines).strip()
+    if len(message) > 3900:
+        message = message[:3890] + "\n…"
+    return message
 
 
-def push_news_to_all(category: Optional[str] = None, limit: Optional[int] = None) -> None:
-    category = (category or DEFAULT_NEWS_CATEGORY).lower().strip()
-    limit = limit or DEFAULT_NEWS_LIMIT
-    items = get_news(category, limit)
-    msg = format_news_message(items, title="早安，這是今天的新聞整理")
+def parse_news_command(text: str) -> Dict[str, Any]:
+    parts = text.strip().split()
+    category = DEFAULT_NEWS_CATEGORY
+    limit = DEFAULT_NEWS_LIMIT
 
-    for chat_id in get_all_target_chat_ids():
-        try:
-            send_message(chat_id, msg, disable_web_page_preview=True)
-        except Exception as e:
-            logger.exception("Push news failed to %s: %s", chat_id, e)
+    if len(parts) >= 2:
+        arg1 = parts[1].lower()
+        if arg1 in ("tech", "technology", "ai", "科技"):
+            category = "tech"
+        elif arg1 in ("business", "biz", "finance", "財經", "商業", "商務"):
+            category = "business"
+        elif arg1 in ("all", "全部"):
+            category = "all"
+        elif arg1.isdigit():
+            limit = max(1, min(10, int(arg1)))
+
+    if len(parts) >= 3:
+        arg2 = parts[2].lower()
+        if arg2.isdigit():
+            limit = max(1, min(10, int(arg2)))
+
+    return {"category": category, "limit": limit}
 
 
-def weather_location_name(city: str) -> str:
-    return city if city else DEFAULT_WEATHER_CITY
-
-
-def fetch_weather_data(city: str) -> Dict[str, Any]:
-    city = weather_location_name(city)
+def fetch_weather(city: str = DEFAULT_WEATHER_CITY) -> Optional[Dict[str, Any]]:
     if not CWA_API_KEY:
-        raise RuntimeError("Missing CWA_API_KEY")
+        logger.warning("CWA_API_KEY not set.")
+        return None
 
     url = "https://opendata.cwa.gov.tw/api/v1/rest/datastore/F-C0032-001"
-    params = {
-        "Authorization": CWA_API_KEY,
-        "format": "JSON",
-        "locationName": city,
-    }
-    resp = requests.get(url, params=params, timeout=HTTP_TIMEOUT)
-    resp.raise_for_status()
-    data = resp.json()
+    params = {"Authorization": CWA_API_KEY, "format": "JSON", "locationName": city}
 
-    locations = data.get("records", {}).get("location", [])
-    if not locations:
-        raise RuntimeError(f"查無天氣資料：{city}")
-
-    location = locations[0]
-    weather_elements = location.get("weatherElement", [])
-
-    result = {
-        "city": city,
-        "wx": [],
-        "pop": [],
-        "minT": [],
-        "maxT": [],
-    }
-
-    for element in weather_elements:
-        name = element.get("elementName")
-        times = element.get("time", [])
-        parsed_times = []
-        for t in times:
-            parsed_times.append(
-                {
-                    "start": t.get("startTime", ""),
-                    "end": t.get("endTime", ""),
-                    "value": ((t.get("parameter", {}) or {}).get("parameterName", "")),
-                }
-            )
-        if name in result:
-            result[name] = parsed_times
-
-    return result
-
-
-def build_weather_message(city: str) -> str:
-    data = fetch_weather_data(city)
-    city_name = data["city"]
-
-    lines = [f"{city_name} 天氣預報", ""]
-    for idx in range(min(3, len(data["wx"]))):
-        start = data["wx"][idx]["start"]
-        end = data["wx"][idx]["end"]
-        wx = data["wx"][idx]["value"]
-        pop = data["pop"][idx]["value"] if idx < len(data["pop"]) else ""
-        min_t = data["minT"][idx]["value"] if idx < len(data["minT"]) else ""
-        max_t = data["maxT"][idx]["value"] if idx < len(data["maxT"]) else ""
-
-        lines.append(f"時段：{start} ~ {end}")
-        lines.append(f"天氣：{wx}")
-        lines.append(f"降雨機率：{pop}%")
-        if min_t and max_t:
-            lines.append(f"溫度：{min_t}~{max_t}°C")
-        lines.append("")
-
-    return "\n".join(lines).strip()
-
-
-def push_weather_to_all(city: Optional[str] = None) -> None:
-    city = city or DEFAULT_WEATHER_CITY
     try:
-        msg = "早安，這是今天的天氣資訊\n\n" + build_weather_message(city)
+        r = requests.get(url, params=params, timeout=HTTP_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+
+        locations = data.get("records", {}).get("location", [])
+        if not locations:
+            return None
+
+        loc = locations[0]
+        weather_elements = {item["elementName"]: item["time"] for item in loc.get("weatherElement", [])}
+
+        wx_list = weather_elements.get("Wx", [])
+        pop_list = weather_elements.get("PoP", [])
+        min_list = weather_elements.get("MinT", [])
+        max_list = weather_elements.get("MaxT", [])
+        ci_list = weather_elements.get("CI", [])
+
+        if not wx_list:
+            return None
+
+        return {
+            "city": loc.get("locationName", city),
+            "start": wx_list[0].get("startTime", ""),
+            "end": wx_list[0].get("endTime", ""),
+            "weather": wx_list[0].get("parameter", {}).get("parameterName", ""),
+            "pop": pop_list[0].get("parameter", {}).get("parameterName", "") if pop_list else "",
+            "min_temp": min_list[0].get("parameter", {}).get("parameterName", "") if min_list else "",
+            "max_temp": max_list[0].get("parameter", {}).get("parameterName", "") if max_list else "",
+            "comfort": ci_list[0].get("parameter", {}).get("parameterName", "") if ci_list else "",
+        }
     except Exception as e:
-        logger.exception("Push weather failed when building message: %s", e)
-        msg = f"早安，今天天氣資訊暫時抓取失敗：{e}"
-
-    for chat_id in get_all_target_chat_ids():
-        try:
-            send_message(chat_id, msg, disable_web_page_preview=True)
-        except Exception as e:
-            logger.exception("Push weather failed to %s: %s", chat_id, e)
+        logger.exception("Weather fetch failed: %s", e)
+        return None
 
 
-CHINESE_DIGITS = {
-    "零": 0,
-    "〇": 0,
-    "一": 1,
-    "二": 2,
-    "兩": 2,
-    "三": 3,
-    "四": 4,
-    "五": 5,
-    "六": 6,
-    "七": 7,
-    "八": 8,
-    "九": 9,
+def format_weather_message(weather: Optional[Dict[str, Any]]) -> str:
+    if not weather:
+        if not CWA_API_KEY:
+            return "目前尚未設定 CWA_API_KEY，無法取得天氣。"
+        return "天氣資料取得失敗，請稍後再試。"
+
+    city = weather.get("city", DEFAULT_WEATHER_CITY)
+    weather_text = weather.get("weather", "")
+    pop = weather.get("pop", "")
+    min_temp = weather.get("min_temp", "")
+    max_temp = weather.get("max_temp", "")
+    comfort = weather.get("comfort", "")
+    start = weather.get("start", "")
+    end = weather.get("end", "")
+
+    tip = ""
+    try:
+        pop_value = int(pop)
+        if pop_value >= 50:
+            tip = "提醒：降雨機率偏高，建議帶傘。"
+        elif pop_value >= 20:
+            tip = "提醒：可能有局部降雨，外出可備傘。"
+        else:
+            tip = "提醒：降雨機率不高。"
+    except Exception:
+        pass
+
+    lines = [
+        f"🌤️ {city} 天氣預報",
+        f"時段：{start} ~ {end}",
+        f"天氣：{weather_text}",
+        f"溫度：{min_temp} ~ {max_temp}°C",
+        f"降雨機率：{pop}%",
+    ]
+    if comfort:
+        lines.append(f"體感：{comfort}")
+    if tip:
+        lines.append(tip)
+    return "\n".join(lines)
+
+
+def handle_weather(chat_id: int, text: str = "") -> None:
+    register_chat_id(chat_id)
+    city = DEFAULT_WEATHER_CITY
+    parts = text.strip().split(maxsplit=1)
+    if len(parts) >= 2 and parts[1].strip():
+        city = parts[1].strip()
+    send_message(chat_id, format_weather_message(fetch_weather(city)))
+
+
+def send_daily_weather() -> None:
+    logger.info("Running scheduled daily weather push...")
+    chat_ids = get_all_target_chat_ids()
+    if not chat_ids:
+        logger.warning("No chat ids found. Skip daily weather push.")
+        return
+    try:
+        message = format_weather_message(fetch_weather(DEFAULT_WEATHER_CITY))
+        for chat_id in chat_ids:
+            try:
+                send_message(chat_id, message)
+                logger.info("Daily weather sent to %s", chat_id)
+            except Exception as e:
+                logger.exception("Failed to send daily weather to %s: %s", chat_id, e)
+    except Exception as e:
+        logger.exception("Daily weather job failed: %s", e)
+
+
+ADVANCE_REMINDER_RULES = [
+    ("1h", "- 1小時前", timedelta(hours=1)),
+    ("event", "- 事件時間", timedelta(seconds=0)),
+]
+
+CHINESE_NUMBER_MAP = {
+    "零": 0, "〇": 0, "○": 0, "Ｏ": 0,
+    "一": 1, "二": 2, "兩": 2, "三": 3, "四": 4,
+    "五": 5, "六": 6, "七": 7, "八": 8, "九": 9,
 }
 
 
-def now_local() -> datetime:
-    return datetime.now(TZINFO)
+def normalize_keyword_for_event(message: str) -> str:
+    text = re.sub(r"\s+", "", message.strip().lower())
+    return text[:30] if text else "event"
 
 
-def strip_reminder_prefix(text: str) -> str:
-    text = text.strip()
-    prefixes = ["提醒我", "提醒", "記得", "幫我提醒", "請提醒我", "請提醒"]
-    for prefix in prefixes:
-        if text.startswith(prefix):
-            return text[len(prefix):].strip()
+def normalize_message_for_compare(message: str) -> str:
+    text = message.strip().lower()
+    text = re.sub(r"\s+", "", text)
+    text = re.sub(r"[，。,\.！!？?、~～\-—_]+", "", text)
     return text
 
 
-def remove_leading_connectors(text: str) -> str:
-    text = text.strip()
-    while True:
-        new_text = re.sub(r"^(要|去|來|再|一下|一下要|一下去)\s*", "", text)
-        if new_text == text:
-            break
-        text = new_text.strip()
-    return text
-
-
-def is_valid_message_text(message: str) -> bool:
-    return bool(message and message.strip())
-
-
-def normalize_space(text: str) -> str:
-    text = text.replace("：", ":")
-    text = text.replace("，", " ")
-    text = text.replace("。", " ")
-    text = text.replace("、", " ")
-    text = text.replace("（", "(").replace("）", ")")
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
-
-
-def chinese_num_to_int(text: str) -> Optional[int]:
-    text = text.strip()
-    if not text:
+def chinese_numeral_to_int(text: str) -> Optional[int]:
+    s = text.strip()
+    if not s:
         return None
-    if text.isdigit():
-        return int(text)
-    if text == "十":
+    if s.isdigit():
+        return int(s)
+    if s == "十":
         return 10
-
-    if all(ch in CHINESE_DIGITS for ch in text):
-        value = 0
-        for ch in text:
-            value = value * 10 + CHINESE_DIGITS[ch]
-        return value
-
-    if "十" in text:
-        parts = text.split("十")
+    if "十" in s:
+        parts = s.split("十")
         if len(parts) != 2:
             return None
-
         left, right = parts
-        if left == "":
-            tens = 1
-        elif left in CHINESE_DIGITS:
-            tens = CHINESE_DIGITS[left]
-        else:
+        tens = 1 if left == "" else CHINESE_NUMBER_MAP.get(left)
+        if tens is None:
             return None
-
-        if right == "":
-            ones = 0
-        elif right in CHINESE_DIGITS:
-            ones = CHINESE_DIGITS[right]
-        else:
+        ones = 0 if right == "" else CHINESE_NUMBER_MAP.get(right)
+        if ones is None:
             return None
-
         return tens * 10 + ones
+    value = 0
+    for ch in s:
+        if ch not in CHINESE_NUMBER_MAP:
+            return None
+        value = value * 10 + CHINESE_NUMBER_MAP[ch]
+    return value
 
-    return None
+
+def replace_chinese_number_in_match(match: re.Match) -> str:
+    value = chinese_numeral_to_int(match.group(1))
+    return match.group(0) if value is None else str(value)
 
 
-def parse_time_of_day(hour: int, minute: int, meridiem: Optional[str]) -> Tuple[int, int]:
-    if meridiem in ("下午", "晚上"):
-        if hour < 12:
-            hour += 12
-    elif meridiem == "中午":
-        if hour != 12:
-            hour += 12
-    elif meridiem == "凌晨":
-        if hour == 12:
-            hour = 0
-    elif meridiem in ("早上", "上午", "清晨"):
-        if hour == 12:
-            hour = 0
-    return hour, minute
+def normalize_chinese_time_text(text: str) -> str:
+    normalized = text.strip()
+    normalized = re.sub(
+        r"([零〇○Ｏ一二兩三四五六七八九十\d]+)(?=\s*(分鐘|分|min|mins|minute|minutes|小時|hr|hrs|hour|hours)\s*後)",
+        replace_chinese_number_in_match,
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    normalized = re.sub(r"([零〇○Ｏ一二兩三四五六七八九十\d]+)(?=\s*點)", replace_chinese_number_in_match, normalized)
+    normalized = re.sub(r"([零〇○Ｏ一二兩三四五六七八九十\d]+)(?=\s*分)", replace_chinese_number_in_match, normalized)
+    normalized = re.sub(r"(?<=[:：])\s*([零〇○Ｏ一二兩三四五六七八九十\d]+)", replace_chinese_number_in_match, normalized)
+    return normalized
 
 
 def parse_relative_reminder(text: str) -> Optional[Dict[str, Any]]:
-    original = text.strip()
-    text = strip_reminder_prefix(original)
-    text = normalize_space(text)
+    raw = normalize_chinese_time_text(text.strip())
+    now = datetime.now(TZINFO)
 
-    patterns = [
-        r"^(?P<num>\d+|[零〇一二兩三四五六七八九十]+)\s*分鐘後(?P<msg>.+)$",
-        r"^(?P<num>\d+|[零〇一二兩三四五六七八九十]+)\s*分後(?P<msg>.+)$",
-        r"^(?P<num>\d+|[零〇一二兩三四五六七八九十]+)\s*小時後(?P<msg>.+)$",
-        r"^(?P<num>\d+|[零〇一二兩三四五六七八九十]+)\s*個小時後(?P<msg>.+)$",
-    ]
-
-    for pattern in patterns:
-        m = re.match(pattern, text)
-        if not m:
-            continue
-
-        num = chinese_num_to_int(m.group("num"))
-        msg = remove_leading_connectors(m.group("msg").strip())
-        if not num or not is_valid_message_text(msg):
-            return None
-
-        if "分鐘" in pattern or "分後" in pattern:
-            target_time = now_local() + timedelta(minutes=num)
-        else:
-            target_time = now_local() + timedelta(hours=num)
-
-        return {
-            "event_time": target_time,
-            "message": msg,
-            "keyword": msg[:40],
-            "source_text": original,
-        }
-
-    return None
-
-
-def parse_absolute_reminder(text: str) -> Optional[Dict[str, Any]]:
-    original = text.strip()
-    text = strip_reminder_prefix(original)
-    text = normalize_space(text)
-
-    base_date = now_local().date()
-
-    day_offset = None
-    for token, offset in [("今天", 0), ("明天", 1), ("昨天", -1), ("後天", 2)]:
-        if token in text:
-            day_offset = offset
-            text = text.replace(token, " ")
-            break
-
-    if day_offset is None:
-        if re.search(r"\d{1,2}\s*/\s*\d{1,2}", text):
-            pass
-        elif re.search(r"\d{1,2}\s*月\s*\d{1,2}\s*日", text):
-            pass
-        else:
-            day_offset = 0
-
-    target_date = base_date + timedelta(days=day_offset or 0)
-
-    md_match = re.search(r"(?P<month>\d{1,2})\s*/\s*(?P<day>\d{1,2})", text)
-    if md_match:
-        month = int(md_match.group("month"))
-        day = int(md_match.group("day"))
-        year = base_date.year
-        try:
-            candidate = datetime(year, month, day, tzinfo=TZINFO).date()
-            if candidate < base_date:
-                candidate = datetime(year + 1, month, day, tzinfo=TZINFO).date()
-            target_date = candidate
-            text = text.replace(md_match.group(0), " ")
-        except ValueError:
-            return None
-    else:
-        md_match = re.search(r"(?P<month>\d{1,2})\s*月\s*(?P<day>\d{1,2})\s*日?", text)
-        if md_match:
-            month = int(md_match.group("month"))
-            day = int(md_match.group("day"))
-            year = base_date.year
-            try:
-                candidate = datetime(year, month, day, tzinfo=TZINFO).date()
-                if candidate < base_date:
-                    candidate = datetime(year + 1, month, day, tzinfo=TZINFO).date()
-                target_date = candidate
-                text = text.replace(md_match.group(0), " ")
-            except ValueError:
-                return None
-
-    text = re.sub(r"(在|於)\s*", " ", text)
-
-    time_pattern = (
-        r"(?P<meridiem>凌晨|早上|上午|中午|下午|晚上)?\s*"
-        r"(?P<hour>\d{1,2})"
-        r"(?:\s*[:點]\s*(?P<minute>\d{1,2}))?"
-        r"\s*(?:分)?"
+    m = re.match(
+        r"^\s*(\d+)\s*(分鐘|分|min|mins|minute|minutes|小時|hr|hrs|hour|hours)\s*後\s*(提醒我)?\s*(.+?)\s*$",
+        raw,
+        re.IGNORECASE
     )
-    m = re.search(time_pattern, text)
     if not m:
         return None
 
-    meridiem = m.group("meridiem")
-    hour = int(m.group("hour"))
-    minute = int(m.group("minute") or 0)
-
-    if hour > 23 or minute > 59:
+    amount_str, unit, _, msg = m.groups()
+    amount = int(amount_str)
+    if amount <= 0:
         return None
 
-    if meridiem:
-        hour, minute = parse_time_of_day(hour, minute, meridiem)
+    unit = unit.lower()
+    event_time = now + (timedelta(minutes=amount) if unit in ("分鐘", "分", "min", "mins", "minute", "minutes") else timedelta(hours=amount))
+    return {"event_time": event_time, "message": msg.strip()}
 
-    event_time = datetime(
-        target_date.year,
-        target_date.month,
-        target_date.day,
-        hour,
-        minute,
-        tzinfo=TZINFO,
+
+def parse_absolute_reminder(text: str) -> Optional[Dict[str, Any]]:
+    raw = normalize_chinese_time_text(text.strip())
+    now = datetime.now(TZINFO)
+
+    m = re.match(r"^\s*(\d{4}-\d{2}-\d{2})\s+(\d{1,2}):(\d{2})\s+(.+?)\s*$", raw)
+    if m:
+        date_str, hour_str, minute_str, msg = m.groups()
+        dt = datetime.strptime(f"{date_str} {hour_str}:{minute_str}", "%Y-%m-%d %H:%M").replace(tzinfo=TZINFO)
+        if dt <= now:
+            return None
+        return {"event_time": dt, "message": msg.strip()}
+
+    m = re.match(
+        r"^\s*(今天|明天|昨天)?\s*(早上|上午|中午|下午|晚上)?\s*(\d{1,2})(?:(?:\s*[:：]\s*(\d{1,2}))|(?:\s*點\s*(半|(\d{1,2}))?))?\s*(?:分)?\s*(提醒我)?\s*(.+?)\s*$",
+        raw
     )
-
-    if day_offset == 0 and not re.search(r"(今天|明天|昨天|後天|\d{1,2}\s*/\s*\d{1,2}|\d{1,2}\s*月\s*\d{1,2}\s*日?)", original):
-        if event_time < now_local():
-            event_time += timedelta(days=1)
-
-    msg = (text[:m.start()] + " " + text[m.end():]).strip()
-    msg = remove_leading_connectors(msg)
-    msg = re.sub(r"\s+", " ", msg).strip()
-
-    if not is_valid_message_text(msg):
+    if not m:
         return None
 
-    return {
-        "event_time": event_time,
-        "message": msg,
-        "keyword": msg[:40],
-        "source_text": original,
-    }
+    day_word, period, hour_str, minute_str_colon, half_flag, minute_str_dot, _, msg = m.groups()
+
+    if day_word == "明天":
+        base_date = (now + timedelta(days=1)).date()
+    elif day_word == "昨天":
+        return None
+    else:
+        base_date = now.date()
+
+    hour = int(hour_str)
+
+    if minute_str_colon is not None:
+        minute = int(minute_str_colon)
+    elif half_flag == "半":
+        minute = 30
+    elif minute_str_dot is not None:
+        minute = int(minute_str_dot)
+    else:
+        minute = 0
+
+    if period in ("下午", "晚上") and hour < 12:
+        hour += 12
+    elif period == "中午":
+        if hour != 12 and hour < 11:
+            hour += 12
+    elif period in ("早上", "上午") and hour == 12:
+        hour = 0
+
+    try:
+        dt = datetime(base_date.year, base_date.month, base_date.day, hour, minute, tzinfo=TZINFO)
+    except ValueError:
+        return None
+
+    if dt <= now:
+        return None
+
+    return {"event_time": dt, "message": msg.strip()}
 
 
 def parse_chinese_reminder(text: str) -> Optional[Dict[str, Any]]:
     return parse_relative_reminder(text) or parse_absolute_reminder(text)
 
 
-def split_multi_reminder_text(text: str) -> List[str]:
-    normalized = text.replace("；", ";")
-    normalized = re.sub(r"\s*;\s*", "\n", normalized)
-    parts = [part.strip() for part in normalized.splitlines()]
-    return [part for part in parts if part]
-
-
-def parse_multiple_chinese_reminders(text: str) -> Tuple[List[Tuple[int, str, Dict[str, Any]]], List[Tuple[int, str]]]:
-    parts = split_multi_reminder_text(text)
-    if not parts:
-        return [], []
-
-    success_items: List[Tuple[int, str, Dict[str, Any]]] = []
-    failed_items: List[Tuple[int, str]] = []
-
-    for idx, part in enumerate(parts, start=1):
-        parsed = parse_chinese_reminder(part)
-        if parsed:
-            success_items.append((idx, part, parsed))
-        else:
-            failed_items.append((idx, part))
-
-    return success_items, failed_items
-
-
-def get_notification_offsets(event_time: datetime) -> List[int]:
-    now = now_local()
-    offsets = []
-
-    for delta in [timedelta(hours=2), timedelta(hours=1), timedelta(minutes=30)]:
-        notify_time = event_time - delta
-        if notify_time > now:
-            offsets.append(int((event_time - notify_time).total_seconds()))
-
-    offsets.append(0)
-    return sorted(list(set(offsets)), reverse=True)
-
-
-def migrate_tables() -> None:
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT column_name
-                FROM information_schema.columns
-                WHERE table_name = 'reminder_events'
-                """
-            )
-            existing_columns = {row_get(row, "column_name") for row in cur.fetchall()}
-
-            if "completed_at" not in existing_columns:
-                cur.execute("ALTER TABLE reminder_events ADD COLUMN completed_at TIMESTAMP NULL")
-                logger.info("Added completed_at column to reminder_events")
-
-            cur.execute(
-                """
-                SELECT column_name
-                FROM information_schema.columns
-                WHERE table_name = 'reminder_notifications'
-                """
-            )
-            notification_columns = {row_get(row, "column_name") for row in cur.fetchall()}
-
-            if "notify_at" not in notification_columns:
-                cur.execute("ALTER TABLE reminder_notifications ADD COLUMN notify_at TIMESTAMP NULL")
-                logger.info("Added notify_at column to reminder_notifications")
-
-            if "offset_seconds" not in notification_columns:
-                cur.execute(
-                    "ALTER TABLE reminder_notifications ADD COLUMN offset_seconds INTEGER NOT NULL DEFAULT 0"
-                )
-                logger.info("Added offset_seconds column to reminder_notifications")
-
-            if "sent" not in notification_columns:
-                cur.execute("ALTER TABLE reminder_notifications ADD COLUMN sent BOOLEAN NOT NULL DEFAULT FALSE")
-                logger.info("Added sent column to reminder_notifications")
-
-        conn.commit()
-
-
-def save_event_and_notifications(
-    chat_id: int,
-    event_time: datetime,
-    message: str,
-    keyword: str,
-) -> Tuple[int, List[Tuple[int, datetime, int]]]:
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO reminder_events (chat_id, event_time, message, keyword, canceled, created_at)
-                VALUES (%s, %s, %s, %s, FALSE, NOW())
-                RETURNING id
-                """,
-                (chat_id, event_time.replace(tzinfo=None), message, keyword),
-            )
-            event_row = cur.fetchone()
-            event_id = int(row_get(event_row, "id", 0))
-
-            offsets = get_notification_offsets(event_time)
-            notification_rows: List[Tuple[int, datetime, int]] = []
-
-            for offset_seconds in offsets:
-                notify_at = event_time - timedelta(seconds=offset_seconds)
-                cur.execute(
-                    """
-                    INSERT INTO reminder_notifications
-                    (event_id, notify_at, offset_seconds, sent, created_at)
-                    VALUES (%s, %s, %s, FALSE, NOW())
-                    ON CONFLICT (event_id, offset_seconds) DO NOTHING
-                    RETURNING id
-                    """,
-                    (event_id, notify_at.replace(tzinfo=None), offset_seconds),
-                )
-                inserted = cur.fetchone()
-                if inserted:
-                    notification_id = int(row_get(inserted, "id", 0))
-                else:
-                    cur.execute(
-                        """
-                        SELECT id
-                        FROM reminder_notifications
-                        WHERE event_id = %s AND offset_seconds = %s
-                        """,
-                        (event_id, offset_seconds),
-                    )
-                    existing = cur.fetchone()
-                    notification_id = int(row_get(existing, "id", 0))
-
-                notification_rows.append((notification_id, notify_at, offset_seconds))
-
-        conn.commit()
-        return event_id, notification_rows
-
-
-def offset_label(offset_seconds: int) -> str:
-    if offset_seconds == 7200:
-        return "前2小時"
-    if offset_seconds == 3600:
-        return "前1小時"
-    if offset_seconds == 1800:
-        return "前30分鐘"
-    return "時間到"
-
-
-def schedule_single_notification(
-    notification_id: int,
-    event_id: int,
-    chat_id: int,
-    event_time: datetime,
-    message: str,
-    offset_seconds: int,
-    notify_at: datetime,
-) -> None:
-    job_id = f"notif_{notification_id}"
-    scheduler.add_job(
-        send_event_notification,
-        "date",
-        run_date=notify_at,
-        id=job_id,
-        replace_existing=True,
-        kwargs={
-            "notification_id": notification_id,
-            "event_id": event_id,
-            "chat_id": chat_id,
-            "event_time_iso": event_time.isoformat(),
-            "message": message,
-            "offset_seconds": offset_seconds,
-        },
-        misfire_grace_time=3600,
-    )
-
-
-def remove_scheduler_jobs_for_event(event_id: int) -> None:
-    with get_conn() as conn:
+def get_notification_ids_by_event(event_id: int) -> List[int]:
+    conn = get_conn()
+    try:
         with conn.cursor() as cur:
             cur.execute(
                 """
                 SELECT id
                 FROM reminder_notifications
-                WHERE event_id = %s
+                WHERE event_id = %s AND sent = 0
                 """,
-                (event_id,),
+                (event_id,)
+            )
+            return [int(row["id"]) for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def is_notification_active(notification_id: int) -> bool:
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT rn.sent, rn.canceled, re.canceled AS event_canceled
+                FROM reminder_notifications rn
+                JOIN reminder_events re ON rn.event_id = re.id
+                WHERE rn.id = %s
+                """,
+                (notification_id,)
+            )
+            row = cur.fetchone()
+            if not row:
+                return False
+            return int(row["sent"]) == 0 and int(row["canceled"]) == 0 and int(row["event_canceled"]) == 0
+    finally:
+        conn.close()
+
+
+def find_duplicate_event(chat_id: int, event_time: datetime, message: str) -> Optional[Dict[str, Any]]:
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, event_time, message, keyword
+                FROM reminder_events
+                WHERE chat_id = %s
+                  AND event_time = %s
+                  AND canceled = 0
+                ORDER BY id DESC
+                """,
+                (chat_id, event_time)
             )
             rows = cur.fetchall()
 
-    for row in rows:
-        notification_id = int(row_get(row, "id", 0))
-        job_id = f"notif_{notification_id}"
-        try:
-            scheduler.remove_job(job_id)
-        except JobLookupError:
-            pass
-        except Exception as e:
-            logger.exception("Failed to remove job %s: %s", job_id, e)
+        target_message = normalize_message_for_compare(message)
+        for row in rows:
+            if normalize_message_for_compare(row["message"]) == target_message:
+                return row
+        return None
+    finally:
+        conn.close()
 
 
-def load_pending_notifications_into_scheduler() -> None:
-    now_naive = now_local().replace(tzinfo=None)
+def save_event_with_notifications(chat_id: int, event_time: datetime, message: str) -> Dict[str, Any]:
+    conn = get_conn()
+    try:
+        keyword = normalize_keyword_for_event(message)
+        now_dt = datetime.now(TZINFO)
 
-    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO reminder_events (chat_id, event_time, message, keyword, canceled, created_at)
+                VALUES (%s, %s, %s, %s, 0, %s)
+                RETURNING id
+                """,
+                (chat_id, event_time, message, keyword, now_dt)
+            )
+            event_id = int(cur.fetchone()["id"])
+
+            notifications = []
+            for notify_type, label, delta in ADVANCE_REMINDER_RULES:
+                notify_time = event_time - delta if delta.total_seconds() > 0 else event_time
+                if notify_time <= datetime.now(TZINFO) and notify_type != "event":
+                    continue
+
+                cur.execute(
+                    """
+                    INSERT INTO reminder_notifications
+                    (event_id, chat_id, notify_time, notify_type, label, sent, canceled, created_at)
+                    VALUES (%s, %s, %s, %s, %s, 0, 0, %s)
+                    RETURNING id
+                    """,
+                    (event_id, chat_id, notify_time, notify_type, label, now_dt)
+                )
+                notification_id = int(cur.fetchone()["id"])
+                notifications.append(
+                    {
+                        "notification_id": notification_id,
+                        "notify_time": notify_time,
+                        "notify_type": notify_type,
+                        "label": label,
+                    }
+                )
+
+        conn.commit()
+        return {
+            "event_id": event_id,
+            "event_time": event_time,
+            "message": message,
+            "keyword": keyword,
+            "notifications": notifications,
+        }
+    finally:
+        conn.close()
+
+
+def get_pending_notifications() -> List[Dict[str, Any]]:
+    conn = get_conn()
+    try:
         with conn.cursor() as cur:
             cur.execute(
                 """
                 SELECT
                     rn.id,
                     rn.event_id,
-                    re.chat_id,
+                    rn.chat_id,
+                    rn.notify_time,
+                    rn.notify_type,
+                    rn.label,
                     re.event_time,
-                    re.message,
-                    rn.offset_seconds,
-                    rn.notify_at
+                    re.message
                 FROM reminder_notifications rn
                 JOIN reminder_events re ON rn.event_id = re.id
-                WHERE re.canceled = FALSE
-                  AND rn.sent = FALSE
-                  AND rn.notify_at IS NOT NULL
-                  AND rn.notify_at > %s
-                ORDER BY rn.notify_at ASC
-                """,
-                (now_naive,),
+                WHERE rn.sent = 0 AND rn.canceled = 0 AND re.canceled = 0
+                ORDER BY rn.notify_time ASC
+                """
             )
-            rows = cur.fetchall()
-
-    for row in rows:
-        try:
-            notification_id = int(row_get(row, "id", 0))
-            event_id = int(row_get(row, "event_id", 1))
-            chat_id = int(row_get(row, "chat_id", 2))
-            event_time = parse_db_datetime(row_get(row, "event_time", 3))
-            message = row_get(row, "message", 4, "")
-            offset_seconds = int(row_get(row, "offset_seconds", 5))
-            notify_at_raw = row_get(row, "notify_at", 6)
-
-            if not notify_at_raw:
-                continue
-
-            notify_at = parse_db_datetime(notify_at_raw)
-
-            schedule_single_notification(
-                notification_id=notification_id,
-                event_id=event_id,
-                chat_id=chat_id,
-                event_time=event_time,
-                message=message,
-                offset_seconds=offset_seconds,
-                notify_at=notify_at,
-            )
-        except Exception as e:
-            logger.exception("Failed loading pending notification row=%s error=%s", row, e)
+            return cur.fetchall()
+    finally:
+        conn.close()
 
 
-def get_event_list(chat_id: int) -> List[Dict[str, Any]]:
-    with get_conn() as conn:
+def get_due_unsent_notifications() -> List[Dict[str, Any]]:
+    conn = get_conn()
+    try:
         with conn.cursor() as cur:
             cur.execute(
                 """
                 SELECT
-                    id,
-                    event_time,
-                    message,
-                    keyword,
-                    canceled,
-                    created_at,
-                    completed_at
-                FROM reminder_events
-                WHERE chat_id = %s
-                  AND canceled = FALSE
-                ORDER BY event_time ASC, id ASC
+                    rn.id,
+                    rn.event_id,
+                    rn.chat_id,
+                    rn.notify_time,
+                    rn.notify_type,
+                    rn.label,
+                    re.event_time,
+                    re.message
+                FROM reminder_notifications rn
+                JOIN reminder_events re ON rn.event_id = re.id
+                WHERE rn.sent = 0
+                  AND rn.canceled = 0
+                  AND re.canceled = 0
+                  AND rn.notify_time <= %s
+                ORDER BY rn.notify_time ASC
                 """,
-                (chat_id,),
+                (datetime.now(TZINFO),)
             )
-            rows = cur.fetchall()
-
-    result = []
-    for row in rows:
-        result.append(
-            {
-                "id": int(row_get(row, "id", 0)),
-                "event_time": parse_db_datetime(row_get(row, "event_time", 1)),
-                "message": row_get(row, "message", 2, ""),
-                "keyword": row_get(row, "keyword", 3, "") or "",
-                "canceled": bool(row_get(row, "canceled", 4, False)),
-                "created_at": parse_db_datetime(row_get(row, "created_at", 5)),
-                "completed_at": parse_db_datetime(row_get(row, "completed_at", 6)) if row_get(row, "completed_at", 6) else None,
-            }
-        )
-    return result
+            return cur.fetchall()
+    finally:
+        conn.close()
 
 
-def format_event_line(index: int, item: Dict[str, Any]) -> str:
-    event_time = item["event_time"].strftime("%m/%d %H:%M")
-    return f"{index}. {event_time} {item['message']}"
-
-
-def cancel_event_by_index(chat_id: int, index: int) -> Optional[Dict[str, Any]]:
-    items = get_event_list(chat_id)
-    if index < 1 or index > len(items):
-        return None
-
-    target = items[index - 1]
-    event_id = target["id"]
-
-    with get_conn() as conn:
+def get_user_pending_events(chat_id: int) -> List[Dict[str, Any]]:
+    conn = get_conn()
+    try:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                UPDATE reminder_events
-                SET canceled = TRUE
-                WHERE id = %s
-                """,
-                (event_id,),
-            )
-        conn.commit()
-
-    remove_scheduler_jobs_for_event(event_id)
-    return target
-
-
-def cancel_event_by_keyword(chat_id: int, keyword: str) -> Optional[Dict[str, Any]]:
-    keyword = keyword.strip()
-    if not keyword:
-        return None
-
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT
+                SELECT DISTINCT
                     re.id,
                     re.event_time,
                     re.message,
                     re.keyword
                 FROM reminder_events re
+                JOIN reminder_notifications rn
+                  ON rn.event_id = re.id
                 WHERE re.chat_id = %s
-                  AND re.canceled = FALSE
-                  AND (
-                        re.message ILIKE %s
-                        OR COALESCE(re.keyword, '') ILIKE %s
-                  )
-                ORDER BY re.event_time ASC, re.id ASC
-                LIMIT 1
+                  AND re.canceled = 0
+                  AND rn.canceled = 0
+                  AND rn.sent = 0
+                ORDER BY re.event_time ASC
                 """,
-                (chat_id, f"%{keyword}%", f"%{keyword}%"),
+                (chat_id,)
             )
-            row = cur.fetchone()
-
-            if not row:
-                return None
-
-            event_id = int(row_get(row, "id", 0))
-            cur.execute(
-                """
-                UPDATE reminder_events
-                SET canceled = TRUE
-                WHERE id = %s
-                """,
-                (event_id,),
-            )
-        conn.commit()
-
-    remove_scheduler_jobs_for_event(event_id)
-
-    return {
-        "id": event_id,
-        "event_time": parse_db_datetime(row_get(row, "event_time", 1)),
-        "message": row_get(row, "message", 2, ""),
-        "keyword": row_get(row, "keyword", 3, "") or "",
-    }
+            return cur.fetchall()
+    finally:
+        conn.close()
 
 
-def is_notification_already_sent(notification_id: int) -> bool:
-    with get_conn() as conn:
+def event_has_pending_notifications(event_id: int) -> bool:
+    conn = get_conn()
+    try:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT sent
-                FROM reminder_notifications
-                WHERE id = %s
-                """,
-                (notification_id,),
-            )
-            row = cur.fetchone()
-
-    if not row:
-        return True
-    return bool(row_get(row, "sent", 0, False))
-
-
-def claim_notification_for_send(notification_id: int) -> bool:
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE reminder_notifications
-                SET sent = TRUE
-                WHERE id = %s
-                  AND sent = FALSE
-                RETURNING id
-                """,
-                (notification_id,),
-            )
-            row = cur.fetchone()
-        conn.commit()
-    return bool(row)
-
-
-def revert_notification_claim(notification_id: int) -> None:
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE reminder_notifications
-                SET sent = FALSE
-                WHERE id = %s
-                """,
-                (notification_id,),
-            )
-        conn.commit()
-
-
-def check_and_mark_event_completed(event_id: int) -> bool:
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT COUNT(*) AS remaining
+                SELECT 1
                 FROM reminder_notifications
                 WHERE event_id = %s
-                  AND sent = FALSE
+                  AND canceled = 0
+                  AND sent = 0
+                LIMIT 1
                 """,
-                (event_id,),
+                (event_id,)
             )
-            row = cur.fetchone()
-            remaining = int(row_get(row, "remaining", 0, 0))
-
-            if remaining == 0:
-                cur.execute(
-                    """
-                    UPDATE reminder_events
-                    SET completed_at = COALESCE(completed_at, NOW())
-                    WHERE id = %s
-                    """,
-                    (event_id,),
-                )
-                conn.commit()
-                return True
-
-        conn.commit()
-    return False
+            return cur.fetchone() is not None
+    finally:
+        conn.close()
 
 
 def cleanup_completed_event(event_id: int) -> None:
-    logger.info("Event completed and waiting for daily cleanup: event_id=%s", event_id)
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT 1
+                FROM reminder_notifications
+                WHERE event_id = %s
+                  AND canceled = 0
+                  AND sent = 0
+                LIMIT 1
+                """,
+                (event_id,)
+            )
+            still_pending = cur.fetchone() is not None
+            if still_pending:
+                conn.commit()
+                return
+
+            cur.execute(
+                "DELETE FROM reminder_notifications WHERE event_id = %s",
+                (event_id,)
+            )
+            cur.execute(
+                "DELETE FROM reminder_events WHERE id = %s",
+                (event_id,)
+            )
+
+        conn.commit()
+        logger.info("Cleaned up completed event: event_id=%s", event_id)
+    finally:
+        conn.close()
 
 
-def cleanup_old_data() -> None:
-    cutoff = now_local().replace(tzinfo=None) - timedelta(days=1)
-
-    with get_conn() as conn:
+def cleanup_all_completed_events() -> None:
+    conn = get_conn()
+    try:
         with conn.cursor() as cur:
             cur.execute(
                 """
                 SELECT re.id
                 FROM reminder_events re
-                WHERE re.completed_at IS NOT NULL
-                  AND re.completed_at < %s
-                  AND NOT EXISTS (
-                        SELECT 1
-                        FROM reminder_notifications rn
-                        WHERE rn.event_id = re.id
-                          AND rn.sent = FALSE
-                  )
-                """,
-                (cutoff,),
+                LEFT JOIN reminder_notifications rn
+                  ON rn.event_id = re.id
+                 AND rn.canceled = 0
+                 AND rn.sent = 0
+                WHERE rn.id IS NULL
+                """
             )
             rows = cur.fetchall()
 
-            if not rows:
-                conn.commit()
-                logger.info("Daily cleanup finished: no old completed reminder data to delete")
-                return
-
-            event_ids = [int(row_get(row, "id", 0)) for row in rows]
-
-            cur.execute(
-                "DELETE FROM reminder_notifications WHERE event_id = ANY(%s)",
-                (event_ids,),
-            )
-            cur.execute(
-                "DELETE FROM reminder_events WHERE id = ANY(%s)",
-                (event_ids,),
-            )
-
-        conn.commit()
-
-    logger.info("Daily cleanup finished: deleted %s completed events", len(event_ids))
+        for row in rows:
+            cleanup_completed_event(int(row["id"]))
+    finally:
+        conn.close()
 
 
-def send_event_notification(
-    notification_id: int,
-    event_id: int,
-    chat_id: int,
-    event_time_iso: str,
-    message: str,
-    offset_seconds: int,
-) -> None:
-    claimed = False
-
+def mark_notification_sent(notification_id: int) -> None:
+    conn = get_conn()
     try:
-        if is_notification_already_sent(notification_id):
-            logger.info("Skip duplicate notification (already sent): %s", notification_id)
-            return
-
-        claimed = claim_notification_for_send(notification_id)
-        if not claimed:
-            logger.info("Skip duplicate notification (claim failed): %s", notification_id)
-            return
-
-        label = offset_label(offset_seconds)
-
-        if offset_seconds == 0:
-            text = f"提醒你：{message}"
-        else:
-            text = f"提醒你（{label}）：{message}"
-
-        send_message(chat_id, text, disable_web_page_preview=True)
-
-        if check_and_mark_event_completed(event_id):
-            cleanup_completed_event(event_id)
-
-    except Exception as e:
-        logger.exception("send_event_notification failed: %s", e)
-        if claimed:
-            try:
-                revert_notification_claim(notification_id)
-            except Exception as revert_error:
-                logger.exception("revert_notification_claim failed: %s", revert_error)
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE reminder_notifications SET sent = 1 WHERE id = %s",
+                (notification_id,)
+            )
+        conn.commit()
+    finally:
+        conn.close()
 
 
-def catch_up_missed_notifications() -> None:
-    now_naive = now_local().replace(tzinfo=None)
-
-    with get_conn() as conn:
+def cancel_event_by_id(event_id: int, chat_id: int) -> bool:
+    conn = get_conn()
+    try:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT
-                    rn.id,
-                    rn.event_id,
-                    re.chat_id,
-                    re.event_time,
-                    re.message,
-                    rn.offset_seconds
-                FROM reminder_notifications rn
-                JOIN reminder_events re ON rn.event_id = re.id
-                WHERE re.canceled = FALSE
-                  AND rn.sent = FALSE
-                  AND rn.notify_at IS NOT NULL
-                  AND rn.notify_at <= %s
-                ORDER BY rn.notify_at ASC
+                UPDATE reminder_events
+                SET canceled = 1
+                WHERE id = %s AND chat_id = %s AND canceled = 0
                 """,
-                (now_naive,),
+                (event_id, chat_id)
             )
-            rows = cur.fetchall()
+            if cur.rowcount <= 0:
+                conn.commit()
+                return False
+
+            cur.execute(
+                """
+                UPDATE reminder_notifications
+                SET canceled = 1
+                WHERE event_id = %s
+                """,
+                (event_id,)
+            )
+
+        conn.commit()
+        cleanup_completed_event(event_id)
+        return True
+    finally:
+        conn.close()
+
+
+def find_latest_event_by_keyword(chat_id: int, keyword: str) -> Optional[Dict[str, Any]]:
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, event_time, message, keyword
+                FROM reminder_events
+                WHERE chat_id = %s
+                  AND canceled = 0
+                  AND (
+                        lower(message) LIKE %s
+                        OR lower(keyword) LIKE %s
+                      )
+                ORDER BY event_time DESC
+                LIMIT 1
+                """,
+                (chat_id, f"%{keyword.lower()}%", f"%{keyword.lower()}%")
+            )
+            return cur.fetchone()
+    finally:
+        conn.close()
+
+
+def notification_job_id(notification_id: int) -> str:
+    return f"notify_{notification_id}"
+
+
+def build_notification_text(label: str, event_time: datetime, message: str, event_id: int) -> str:
+    if label == "- 1小時前":
+        return f"⏰ 提醒通知\n還有1小時：{event_time.strftime('%Y-%m-%d %H:%M')}｜{message}"
+    return f"⏰ 提醒通知\n現在時間到：{event_time.strftime('%Y-%m-%d %H:%M')}｜{message}"
+
+
+def schedule_one_notification(
+    notification_id: int,
+    event_id: int,
+    chat_id: int,
+    notify_time: datetime,
+    label: str,
+    event_time: datetime,
+    message: str
+) -> None:
+    job_id = notification_job_id(notification_id)
+
+    def _send():
+        try:
+            if not is_notification_active(notification_id):
+                logger.info("Skip inactive notification id=%s", notification_id)
+                return
+            send_message(chat_id, build_notification_text(label, event_time, message, event_id))
+            mark_notification_sent(notification_id)
+            cleanup_completed_event(event_id)
+            logger.info("Notification sent: id=%s event_id=%s", notification_id, event_id)
+        except Exception as e:
+            logger.exception("Failed to send notification id=%s: %s", notification_id, e)
+
+    try:
+        try:
+            scheduler.remove_job(job_id)
+        except JobLookupError:
+            pass
+
+        scheduler.add_job(
+            _send,
+            trigger="date",
+            run_date=notify_time,
+            id=job_id,
+            replace_existing=True,
+            misfire_grace_time=3600,
+        )
+    except Exception as e:
+        logger.exception("Failed to schedule notification id=%s: %s", notification_id, e)
+
+
+def remove_scheduled_jobs_for_event(event_id: int) -> None:
+    for notification_id in get_notification_ids_by_event(event_id):
+        try:
+            scheduler.remove_job(notification_job_id(notification_id))
+        except JobLookupError:
+            pass
+        except Exception as e:
+            logger.exception("Failed removing notification job id=%s: %s", notification_id, e)
+
+
+def catch_up_missed_notifications() -> None:
+    try:
+        rows = get_due_unsent_notifications()
+        if not rows:
+            cleanup_all_completed_events()
+            return
+
+        logger.info("Catch-up scan found %s due unsent notifications", len(rows))
+
+        for row in rows:
+            notification_id = int(row["id"])
+            event_id = int(row["event_id"])
+            chat_id = int(row["chat_id"])
+
+            if not is_notification_active(notification_id):
+                logger.info("Skip inactive catch-up notification id=%s", notification_id)
+                continue
+
+            event_time = parse_db_datetime(row["event_time"])
+            label = row["label"]
+            message = row["message"]
+
+            send_message(chat_id, build_notification_text(label, event_time, message, event_id))
+            mark_notification_sent(notification_id)
+            cleanup_completed_event(event_id)
+
+            try:
+                scheduler.remove_job(notification_job_id(notification_id))
+            except JobLookupError:
+                pass
+            except Exception as e:
+                logger.exception("Failed removing catch-up job id=%s: %s", notification_id, e)
+
+            logger.info("Catch-up notification sent: id=%s event_id=%s", notification_id, event_id)
+
+        cleanup_all_completed_events()
+    except Exception as e:
+        logger.exception("Catch-up missed notifications failed: %s", e)
+
+
+def load_pending_notifications_into_scheduler() -> None:
+    rows = get_pending_notifications()
+    now = datetime.now(TZINFO)
 
     for row in rows:
-        try:
-            notification_id = int(row_get(row, "id", 0))
-            event_id = int(row_get(row, "event_id", 1))
-            chat_id = int(row_get(row, "chat_id", 2))
-            event_time = row_get(row, "event_time", 3)
-            message = row_get(row, "message", 4, "")
-            offset_seconds = int(row_get(row, "offset_seconds", 5))
+        notify_time = parse_db_datetime(row["notify_time"])
+        if notify_time <= now:
+            continue
 
-            send_event_notification(
-                notification_id=notification_id,
-                event_id=event_id,
-                chat_id=chat_id,
-                event_time_iso=parse_db_datetime(event_time).isoformat(),
-                message=message,
-                offset_seconds=offset_seconds,
-            )
-        except Exception as e:
-            logger.exception("catch_up failed for row=%s error=%s", row, e)
-
-
-def add_reminder(chat_id: int, parsed: Dict[str, Any]) -> Dict[str, Any]:
-    event_time = parsed["event_time"]
-    message = parsed["message"]
-    keyword = parsed.get("keyword") or message[:40]
-
-    event_id, notification_rows = save_event_and_notifications(
-        chat_id,
-        event_time,
-        message,
-        keyword,
-    )
-
-    for notification_id, notify_at, offset_seconds in notification_rows:
-        schedule_single_notification(
-            notification_id=notification_id,
-            event_id=event_id,
-            chat_id=chat_id,
-            event_time=event_time,
-            message=message,
-            offset_seconds=offset_seconds,
-            notify_at=notify_at,
+        schedule_one_notification(
+            notification_id=int(row["id"]),
+            event_id=int(row["event_id"]),
+            chat_id=int(row["chat_id"]),
+            notify_time=notify_time,
+            label=row["label"],
+            event_time=parse_db_datetime(row["event_time"]),
+            message=row["message"],
         )
 
-    return {
-        "event_id": event_id,
-        "event_time": event_time,
-        "message": message,
-        "keyword": keyword,
-        "notification_count": len(notification_rows),
-    }
+
+def send_daily_news() -> None:
+    logger.info("Running scheduled daily news push...")
+    chat_ids = get_all_target_chat_ids()
+    if not chat_ids:
+        logger.warning("No chat ids found. Skip daily news push.")
+        return
+    try:
+        items = fetch_news(category=DEFAULT_NEWS_CATEGORY, limit=DEFAULT_NEWS_LIMIT)
+        if ENABLE_CHINESE_SUMMARY:
+            items = enrich_news_with_chinese_summary(items)
+        message = format_news_message(items, category=DEFAULT_NEWS_CATEGORY, include_summary=True)
+        for chat_id in chat_ids:
+            try:
+                send_message(chat_id, message)
+                logger.info("Daily news sent to %s", chat_id)
+            except Exception as e:
+                logger.exception("Failed to send daily news to %s: %s", chat_id, e)
+    except Exception as e:
+        logger.exception("Daily news job failed: %s", e)
 
 
 def handle_start(chat_id: int) -> None:
     register_chat_id(chat_id)
     msg = (
-        "已啟動。\n\n"
-        "你可以這樣輸入提醒：\n"
-        "1. 30分鐘後喝水\n"
-        "2. 明天早上8點吃早餐\n"
-        "3. 今天下午3點開會\n"
-        "4. 晚上7點打球\n\n"
-        "也支援一次輸入多筆：\n"
-        "明天早上8點吃早餐\n"
-        "明天下午3點開會\n"
-        "明天晚上7點打球\n\n"
-        "或用分號分隔：\n"
-        "30分鐘後喝水；兩小時後洗衣服\n\n"
-        "其他指令：\n"
-        "/list 查看提醒\n"
-        "/cancel 1 取消第1筆\n"
-        "/news 查看新聞\n"
-        "/weather 查看天氣"
+        "✅ Bot 已啟用\n\n"
+        "可用功能：\n"
+        "/news\n/news tech\n/news business\n/weather\n/list\n/cancel 事件代碼\n/help\n\n"
+        "提醒可直接輸入：\n"
+        "晚上7點半打球\n今天早上七點吃早餐\n明天晚上七點半打球\n"
+        "2026-03-27 14:30 開會\n30分鐘後提醒我喝水\n兩小時後提醒我洗衣服"
     )
-    send_message(chat_id, msg, disable_web_page_preview=True)
+    send_message(chat_id, msg)
 
 
 def handle_help(chat_id: int) -> None:
     msg = (
-        "提醒格式範例：\n"
-        "30分鐘後喝水\n"
-        "2小時後洗衣服\n"
-        "明天早上8點吃早餐\n"
-        "今天下午5點打球\n"
-        "晚上7點半買晚餐\n\n"
-        "多筆提醒也可以：\n"
-        "明天早上8點吃早餐\n"
-        "明天下午3點開會\n"
-        "明天晚上7點打球\n\n"
-        "或：\n"
-        "30分鐘後喝水；2小時後洗衣服\n\n"
-        "指令：\n"
-        "/list 查看提醒\n"
-        "/cancel 1 取消指定提醒\n"
-        "/news 查看新聞\n"
-        "/weather 查看天氣"
+        "指令說明\n\n"
+        "/start\n/help\n/news\n/news tech\n/news business\n/weather\n/weather 臺北市\n/list\n/cancel 事件代碼\n\n"
+        "提醒輸入範例：\n"
+        "晚上7點半打球\n今天早上七點吃早餐\n明天晚上七點半打球\n30分鐘後提醒我喝水\n兩小時後提醒我洗衣服\n\n"
+        "取消範例：\n/cancel 12\n取消打球"
     )
-    send_message(chat_id, msg, disable_web_page_preview=True)
+    send_message(chat_id, msg)
 
 
 def handle_news(chat_id: int, text: str) -> None:
-    parts = text.strip().split()
-    category = DEFAULT_NEWS_CATEGORY
-    limit = DEFAULT_NEWS_LIMIT
-
-    if len(parts) >= 2:
-        category = parts[1].lower().strip()
-    if len(parts) >= 3:
-        try:
-            limit = max(1, min(10, int(parts[2])))
-        except ValueError:
-            pass
-
-    items = get_news(category, limit)
-    send_message(chat_id, format_news_message(items, title="最新新聞"), disable_web_page_preview=True)
-
-
-def handle_weather(chat_id: int, text: str) -> None:
-    parts = text.strip().split(maxsplit=1)
-    city = DEFAULT_WEATHER_CITY
-    if len(parts) == 2 and parts[1].strip():
-        city = parts[1].strip()
-
-    try:
-        msg = build_weather_message(city)
-    except Exception as e:
-        logger.exception("handle_weather failed: %s", e)
-        msg = f"天氣查詢失敗：{e}"
-    send_message(chat_id, msg, disable_web_page_preview=True)
+    register_chat_id(chat_id)
+    args = parse_news_command(text)
+    items = fetch_news(category=args["category"], limit=args["limit"])
+    if ENABLE_CHINESE_SUMMARY:
+        items = enrich_news_with_chinese_summary(items)
+    send_message(chat_id, format_news_message(items, category=args["category"], include_summary=True))
 
 
 def handle_list(chat_id: int) -> None:
-    items = get_event_list(chat_id)
-    if not items:
-        send_message(chat_id, "目前沒有未取消的提醒。", disable_web_page_preview=True)
+    rows = get_user_pending_events(chat_id)
+    if not rows:
+        send_message(chat_id, "目前沒有未取消事件提醒。")
         return
 
-    lines = ["目前提醒清單：", ""]
-    for idx, item in enumerate(items, start=1):
-        lines.append(format_event_line(idx, item))
-    send_message(chat_id, "\n".join(lines), disable_web_page_preview=True)
+    lines = ["📌 目前所有未取消提醒", ""]
+    for row in rows[:50]:
+        event_time = parse_db_datetime(row["event_time"])
+        lines.append(f"事件代碼：{row['id']}\n{event_time.strftime('%Y-%m-%d %H:%M')}｜{row['message']}")
+        lines.append("")
+    send_message(chat_id, "\n".join(lines).strip())
 
 
 def handle_cancel(chat_id: int, text: str) -> None:
-    parts = text.strip().split()
-    if len(parts) != 2:
-        send_message(chat_id, "格式錯誤，請用 /cancel 編號，例如：/cancel 1", disable_web_page_preview=True)
+    m = re.match(r"^/cancel\s+(\d+)\s*$", text.strip())
+    if not m:
+        send_message(chat_id, "用法：/cancel 事件代碼")
         return
 
-    try:
-        index = int(parts[1])
-    except ValueError:
-        send_message(chat_id, "請輸入正確編號，例如：/cancel 1", disable_web_page_preview=True)
+    event_id = int(m.group(1))
+    remove_scheduled_jobs_for_event(event_id)
+    ok = cancel_event_by_id(event_id, chat_id)
+    if not ok:
+        send_message(chat_id, f"找不到可取消的事件代碼 #{event_id}")
         return
-
-    item = cancel_event_by_index(chat_id, index)
-    if not item:
-        send_message(chat_id, "找不到該提醒。", disable_web_page_preview=True)
-        return
-
-    send_message(chat_id, f"已取消：{item['message']}", disable_web_page_preview=True)
+    send_message(chat_id, "✅ 已取消提醒")
 
 
 def handle_cancel_by_keyword(chat_id: int, text: str) -> bool:
-    raw = text.strip()
-    patterns = [r"^(取消|刪除|不要提醒我|不用提醒我)\s*(.+)$"]
+    m = re.match(r"^\s*取消\s*(.+?)\s*$", text)
+    if not m:
+        return False
 
-    for pattern in patterns:
-        m = re.match(pattern, raw)
-        if not m:
-            continue
+    keyword = m.group(1).strip()
+    if not keyword:
+        return False
 
-        keyword = m.group(2).strip()
-        if not keyword:
-            send_message(chat_id, "請補上要取消的提醒內容。", disable_web_page_preview=True)
-            return True
-
-        item = cancel_event_by_keyword(chat_id, keyword)
-        if item:
-            send_message(chat_id, f"已取消：{item['message']}", disable_web_page_preview=True)
-        else:
-            send_message(chat_id, "找不到符合的提醒。", disable_web_page_preview=True)
+    row = find_latest_event_by_keyword(chat_id, keyword)
+    if not row:
+        send_message(chat_id, f"找不到符合「{keyword}」的未取消事件。")
         return True
 
-    return False
+    event_id = int(row["id"])
+    event_time = parse_db_datetime(row["event_time"])
+
+    remove_scheduled_jobs_for_event(event_id)
+    ok = cancel_event_by_id(event_id, chat_id)
+    if not ok:
+        send_message(chat_id, "取消失敗，請稍後再試。")
+        return True
+
+    send_message(chat_id, f"✅ 已取消提醒\n{event_time.strftime('%Y-%m-%d %H:%M')}｜{row['message']}")
+    return True
 
 
 def try_handle_event_reminder(chat_id: int, text: str) -> bool:
-    success_items, failed_items = parse_multiple_chinese_reminders(text)
-
-    if not success_items and not failed_items:
+    parsed = parse_chinese_reminder(text)
+    if not parsed:
         return False
 
-    if not success_items:
-        return False
+    event_time = parsed["event_time"]
+    message = parsed["message"]
 
-    created_items = []
-    for _, _, parsed in success_items:
-        created_items.append(add_reminder(chat_id, parsed))
+    replaced = False
+    duplicate = find_duplicate_event(chat_id, event_time, message)
+    if duplicate:
+        old_event_id = int(duplicate["id"])
+        remove_scheduled_jobs_for_event(old_event_id)
+        if cancel_event_by_id(old_event_id, chat_id):
+            replaced = True
 
-    lines: List[str] = []
+    result = save_event_with_notifications(chat_id, event_time, message)
 
-    if len(created_items) == 1 and not failed_items:
-        item = created_items[0]
-        event_time = item["event_time"].strftime("%m/%d %H:%M")
-        send_message(chat_id, f"已新增提醒：{event_time} {item['message']}", disable_web_page_preview=True)
-        return True
+    for n in result["notifications"]:
+        schedule_one_notification(
+            notification_id=n["notification_id"],
+            event_id=result["event_id"],
+            chat_id=chat_id,
+            notify_time=n["notify_time"],
+            label=n["label"],
+            event_time=event_time,
+            message=message,
+        )
 
-    lines.append(f"已新增 {len(created_items)} 筆提醒：")
-    lines.append("")
-    for idx, item in enumerate(created_items, start=1):
-        event_time = item["event_time"].strftime("%m/%d %H:%M")
-        lines.append(f"{idx}. {event_time} {item['message']}")
-
-    if failed_items:
-        lines.append("")
-        lines.append(f"以下 {len(failed_items)} 筆格式無法辨識：")
-        for idx, raw in failed_items:
-            lines.append(f"- 第{idx}筆：{raw}")
-
-    send_message(chat_id, "\n".join(lines), disable_web_page_preview=True)
+    lines = ["✅ 已更新提醒" if replaced else "✅ 已建立提醒"]
+    if replaced:
+        lines.append("已覆蓋先前相同提醒")
+    lines.append(f"{event_time.strftime('%Y-%m-%d %H:%M')}｜{message}")
+    lines.append("提醒時間：前1小時、事件當下")
+    send_message(chat_id, "\n".join(lines))
     return True
 
 
 def handle_unknown(chat_id: int) -> None:
     msg = (
-        "看不懂這句提醒格式。\n\n"
-        "可試試：\n"
-        "30分鐘後喝水\n"
-        "明天早上8點吃早餐\n"
-        "今天下午5點打球\n\n"
-        "也可以一次輸入多筆：\n"
-        "明天早上8點吃早餐\n"
-        "明天下午3點開會\n"
-        "明天晚上7點打球"
+        "我目前支援：\n"
+        "/start\n/help\n/news\n/news tech\n/news business\n/weather\n/list\n/cancel 事件代碼\n\n"
+        "也可以直接輸入：\nnews\nnew\nweather\n天氣\n\n"
+        "也可以直接輸入提醒，例如：\n"
+        "晚上7點半打球\n今天早上七點吃早餐\n明天晚上七點半打球\n兩小時後提醒我喝水\n\n"
+        "取消也可直接輸入：\n取消打球"
     )
-    send_message(chat_id, msg, disable_web_page_preview=True)
+    send_message(chat_id, msg)
 
 
 def schedule_jobs() -> None:
     if not scheduler.running:
         scheduler.start()
 
-    for job_id in ("news_push_job", "weather_push_job", "daily_cleanup_job"):
+    try:
+        scheduler.remove_job("daily_news_job")
+    except JobLookupError:
+        pass
+    except Exception as e:
+        logger.exception("Failed removing old daily_news_job: %s", e)
+
+    hour, minute = NEWS_PUSH_TIME.split(":")
+    scheduler.add_job(
+        send_daily_news,
+        trigger="cron",
+        hour=int(hour),
+        minute=int(minute),
+        id="daily_news_job",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=3600,
+    )
+
+    if WEATHER_PUSH_TIME:
         try:
-            scheduler.remove_job(job_id)
+            scheduler.remove_job("daily_weather_job")
         except JobLookupError:
             pass
         except Exception as e:
-            logger.exception("Failed removing old %s: %s", job_id, e)
+            logger.exception("Failed removing old daily_weather_job: %s", e)
 
-    try:
-        hour, minute = NEWS_PUSH_TIME.split(":")
-        scheduler.add_job(
-            push_news_to_all,
-            "cron",
-            hour=int(hour),
-            minute=int(minute),
-            id="news_push_job",
-            replace_existing=True,
-            misfire_grace_time=3600,
-        )
-        logger.info("News push scheduled at %s (%s)", NEWS_PUSH_TIME, TIMEZONE)
-    except Exception as e:
-        logger.exception("Failed scheduling news push: %s", e)
-
-    if WEATHER_PUSH_TIME and CWA_API_KEY:
         try:
             w_hour, w_minute = WEATHER_PUSH_TIME.split(":")
             scheduler.add_job(
-                push_weather_to_all,
-                "cron",
+                send_daily_weather,
+                trigger="cron",
                 hour=int(w_hour),
                 minute=int(w_minute),
-                id="weather_push_job",
+                id="daily_weather_job",
                 replace_existing=True,
+                max_instances=1,
+                coalesce=True,
                 misfire_grace_time=3600,
             )
-            logger.info("Weather push scheduled at %s (%s)", WEATHER_PUSH_TIME, TIMEZONE)
+            logger.info("Daily weather scheduled at %s (%s)", WEATHER_PUSH_TIME, TIMEZONE)
         except Exception as e:
-            logger.exception("Failed scheduling weather push: %s", e)
+            logger.exception("Failed scheduling daily weather: %s", e)
+
+    try:
+        scheduler.remove_job("catch_up_notifications_job")
+    except JobLookupError:
+        pass
+    except Exception as e:
+        logger.exception("Failed removing old catch_up_notifications_job: %s", e)
 
     scheduler.add_job(
-        cleanup_old_data,
-        "cron",
-        hour=3,
-        minute=30,
-        id="daily_cleanup_job",
+        catch_up_missed_notifications,
+        trigger="interval",
+        minutes=1,
+        id="catch_up_notifications_job",
         replace_existing=True,
+        max_instances=1,
+        coalesce=True,
         misfire_grace_time=3600,
     )
-    logger.info("Daily cleanup scheduled at 03:30 (%s)", TIMEZONE)
+
+    logger.info("Scheduler started. Daily news at %s (%s)", NEWS_PUSH_TIME, TIMEZONE)
+    logger.info("Catch-up scan scheduled every 1 minute")
 
 
 @app.route("/", methods=["GET"])
-def root():
+def home():
     return jsonify(
         {
             "ok": True,
@@ -1562,6 +1392,9 @@ def root():
             "timezone": TIMEZONE,
             "news_push_time": NEWS_PUSH_TIME,
             "weather_push_time": WEATHER_PUSH_TIME,
+            "owner_id_set": bool(OWNER_ID),
+            "openai_model": OPENAI_MODEL,
+            "chinese_summary_enabled": ENABLE_CHINESE_SUMMARY,
             "weather_city": DEFAULT_WEATHER_CITY,
             "weather_enabled": bool(CWA_API_KEY),
         }
@@ -1622,7 +1455,6 @@ def telegram_webhook():
 
 def bootstrap() -> None:
     init_db()
-    migrate_tables()
 
     try:
         set_webhook()
@@ -1631,19 +1463,11 @@ def bootstrap() -> None:
 
     try:
         schedule_jobs()
-    except Exception as e:
-        logger.exception("schedule_jobs failed: %s", e)
-
-    try:
         load_pending_notifications_into_scheduler()
         catch_up_missed_notifications()
+        cleanup_all_completed_events()
     except Exception as e:
-        logger.exception("load/catch_up failed: %s", e)
-
-    try:
-        cleanup_old_data()
-    except Exception as e:
-        logger.exception("cleanup failed: %s", e)
+        logger.exception("scheduler bootstrap failed: %s", e)
 
 
 bootstrap()
