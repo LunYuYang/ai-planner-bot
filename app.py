@@ -42,6 +42,7 @@ CHAT_FILE = os.path.join(DATA_DIR, "chat_ids.json")
 CWA_API_KEY = os.getenv("CWA_API_KEY", "").strip()
 DEFAULT_WEATHER_CITY = os.getenv("DEFAULT_WEATHER_CITY", "臺南市").strip()
 WEATHER_PUSH_TIME = os.getenv("WEATHER_PUSH_TIME", "").strip()
+DAILY_CLEANUP_TIME = os.getenv("DAILY_CLEANUP_TIME", "03:30").strip()
 
 if not BOT_TOKEN:
     raise RuntimeError("Missing BOT_TOKEN in environment variables.")
@@ -884,64 +885,10 @@ def get_user_pending_events(chat_id: int) -> List[Dict[str, Any]]:
         conn.close()
 
 
-def event_has_pending_notifications(event_id: int) -> bool:
-    conn = get_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT 1
-                FROM reminder_notifications
-                WHERE event_id = %s
-                  AND canceled = 0
-                  AND sent = 0
-                LIMIT 1
-                """,
-                (event_id,)
-            )
-            return cur.fetchone() is not None
-    finally:
-        conn.close()
-
-
-def cleanup_completed_event(event_id: int) -> None:
-    conn = get_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT 1
-                FROM reminder_notifications
-                WHERE event_id = %s
-                  AND canceled = 0
-                  AND sent = 0
-                LIMIT 1
-                """,
-                (event_id,)
-            )
-            still_pending = cur.fetchone() is not None
-            if still_pending:
-                conn.commit()
-                return
-
-            cur.execute(
-                "DELETE FROM reminder_notifications WHERE event_id = %s",
-                (event_id,)
-            )
-            cur.execute(
-                "DELETE FROM reminder_events WHERE id = %s",
-                (event_id,)
-            )
-
-        conn.commit()
-        logger.info("Cleaned up completed event: event_id=%s", event_id)
-    finally:
-        conn.close()
-
-
 def cleanup_all_completed_events() -> None:
     conn = get_conn()
     try:
+        now_dt = datetime.now(TZINFO)
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -952,12 +899,28 @@ def cleanup_all_completed_events() -> None:
                  AND rn.canceled = 0
                  AND rn.sent = 0
                 WHERE rn.id IS NULL
-                """
+                  AND (
+                        re.canceled = 1
+                        OR re.event_time <= %s
+                      )
+                """,
+                (now_dt,)
             )
             rows = cur.fetchall()
 
-        for row in rows:
-            cleanup_completed_event(int(row["id"]))
+            for row in rows:
+                event_id = int(row["id"])
+                cur.execute(
+                    "DELETE FROM reminder_notifications WHERE event_id = %s",
+                    (event_id,)
+                )
+                cur.execute(
+                    "DELETE FROM reminder_events WHERE id = %s",
+                    (event_id,)
+                )
+
+        conn.commit()
+        logger.info("Daily cleanup finished. cleaned=%s", len(rows))
     finally:
         conn.close()
 
@@ -1001,8 +964,52 @@ def cancel_event_by_id(event_id: int, chat_id: int) -> bool:
             )
 
         conn.commit()
-        cleanup_completed_event(event_id)
         return True
+    finally:
+        conn.close()
+
+
+def cancel_all_events(chat_id: int) -> int:
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id
+                FROM reminder_events
+                WHERE chat_id = %s
+                  AND canceled = 0
+                """,
+                (chat_id,)
+            )
+            rows = cur.fetchall()
+            event_ids = [int(row["id"]) for row in rows]
+
+            if not event_ids:
+                conn.commit()
+                return 0
+
+            cur.execute(
+                """
+                UPDATE reminder_events
+                SET canceled = 1
+                WHERE chat_id = %s
+                  AND canceled = 0
+                """,
+                (chat_id,)
+            )
+
+            cur.execute(
+                """
+                UPDATE reminder_notifications
+                SET canceled = 1
+                WHERE event_id = ANY(%s)
+                """,
+                (event_ids,)
+            )
+
+        conn.commit()
+        return len(event_ids)
     finally:
         conn.close()
 
@@ -1059,7 +1066,6 @@ def schedule_one_notification(
                 return
             send_message(chat_id, build_notification_text(label, event_time, message, event_id))
             mark_notification_sent(notification_id)
-            cleanup_completed_event(event_id)
             logger.info("Notification sent: id=%s event_id=%s", notification_id, event_id)
         except Exception as e:
             logger.exception("Failed to send notification id=%s: %s", notification_id, e)
@@ -1092,11 +1098,39 @@ def remove_scheduled_jobs_for_event(event_id: int) -> None:
             logger.exception("Failed removing notification job id=%s: %s", notification_id, e)
 
 
+def remove_all_scheduled_jobs_for_chat(chat_id: int) -> None:
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT rn.id
+                FROM reminder_notifications rn
+                JOIN reminder_events re ON rn.event_id = re.id
+                WHERE re.chat_id = %s
+                  AND re.canceled = 0
+                  AND rn.sent = 0
+                """,
+                (chat_id,)
+            )
+            rows = cur.fetchall()
+
+        for row in rows:
+            notification_id = int(row["id"])
+            try:
+                scheduler.remove_job(notification_job_id(notification_id))
+            except JobLookupError:
+                pass
+            except Exception as e:
+                logger.exception("Failed removing notification job id=%s: %s", notification_id, e)
+    finally:
+        conn.close()
+
+
 def catch_up_missed_notifications() -> None:
     try:
         rows = get_due_unsent_notifications()
         if not rows:
-            cleanup_all_completed_events()
             return
 
         logger.info("Catch-up scan found %s due unsent notifications", len(rows))
@@ -1116,7 +1150,6 @@ def catch_up_missed_notifications() -> None:
 
             send_message(chat_id, build_notification_text(label, event_time, message, event_id))
             mark_notification_sent(notification_id)
-            cleanup_completed_event(event_id)
 
             try:
                 scheduler.remove_job(notification_job_id(notification_id))
@@ -1127,7 +1160,6 @@ def catch_up_missed_notifications() -> None:
 
             logger.info("Catch-up notification sent: id=%s event_id=%s", notification_id, event_id)
 
-        cleanup_all_completed_events()
     except Exception as e:
         logger.exception("Catch-up missed notifications failed: %s", e)
 
@@ -1178,10 +1210,22 @@ def handle_start(chat_id: int) -> None:
     msg = (
         "✅ Bot 已啟用\n\n"
         "可用功能：\n"
-        "/news\n/news tech\n/news business\n/weather\n/list\n/cancel 事件代碼\n/help\n\n"
+        "/news\n"
+        "/news tech\n"
+        "/news business\n"
+        "/weather\n"
+        "/list\n"
+        "/cancel 事件代碼\n"
+        "/cancel_all\n"
+        "/help\n\n"
         "提醒可直接輸入：\n"
-        "晚上7點半打球\n今天早上七點吃早餐\n明天晚上七點半打球\n"
-        "2026-03-27 14:30 開會\n30分鐘後提醒我喝水\n兩小時後提醒我洗衣服"
+        "晚上7點半打球\n"
+        "今天早上七點吃早餐\n"
+        "明天晚上七點半打球\n"
+        "2026-03-27 14:30 開會\n"
+        "30分鐘後提醒我喝水\n"
+        "兩小時後提醒我洗衣服\n\n"
+        "多筆提醒可一行一筆輸入。"
     )
     send_message(chat_id, msg)
 
@@ -1189,10 +1233,29 @@ def handle_start(chat_id: int) -> None:
 def handle_help(chat_id: int) -> None:
     msg = (
         "指令說明\n\n"
-        "/start\n/help\n/news\n/news tech\n/news business\n/weather\n/weather 臺北市\n/list\n/cancel 事件代碼\n\n"
+        "/start\n"
+        "/help\n"
+        "/news\n"
+        "/news tech\n"
+        "/news business\n"
+        "/weather\n"
+        "/weather 臺北市\n"
+        "/list\n"
+        "/cancel 事件代碼\n"
+        "/cancel_all\n\n"
         "提醒輸入範例：\n"
-        "晚上7點半打球\n今天早上七點吃早餐\n明天晚上七點半打球\n30分鐘後提醒我喝水\n兩小時後提醒我洗衣服\n\n"
-        "取消範例：\n/cancel 12\n取消打球"
+        "晚上7點半打球\n"
+        "今天早上七點吃早餐\n"
+        "明天晚上七點半打球\n"
+        "30分鐘後提醒我喝水\n"
+        "兩小時後提醒我洗衣服\n\n"
+        "多筆提醒範例：\n"
+        "明天早上9點開會\n"
+        "明天下午2點買東西\n"
+        "30分鐘後提醒我喝水\n\n"
+        "全部取消：\n"
+        "取消所有提醒\n"
+        "/cancel_all"
     )
     send_message(chat_id, msg)
 
@@ -1235,14 +1298,29 @@ def handle_cancel(chat_id: int, text: str) -> None:
     send_message(chat_id, "✅ 已取消提醒")
 
 
+def handle_cancel_all(chat_id: int) -> None:
+    remove_all_scheduled_jobs_for_chat(chat_id)
+    canceled_count = cancel_all_events(chat_id)
+    if canceled_count <= 0:
+        send_message(chat_id, "目前沒有可取消的提醒。")
+        return
+    send_message(chat_id, f"✅ 已取消所有提醒，共 {canceled_count} 筆事件。")
+
+
 def handle_cancel_by_keyword(chat_id: int, text: str) -> bool:
+    normalized = text.strip().replace("　", "")
+    if normalized in ("取消所有提醒", "清空所有提醒", "刪除所有提醒"):
+        handle_cancel_all(chat_id)
+        return True
+
     m = re.match(r"^\s*取消\s*(.+?)\s*$", text)
     if not m:
         return False
 
     keyword = m.group(1).strip()
-    if not keyword:
-        return False
+    if not keyword or keyword == "所有提醒":
+        handle_cancel_all(chat_id)
+        return True
 
     row = find_latest_event_by_keyword(chat_id, keyword)
     if not row:
@@ -1259,6 +1337,66 @@ def handle_cancel_by_keyword(chat_id: int, text: str) -> bool:
         return True
 
     send_message(chat_id, f"✅ 已取消提醒\n{event_time.strftime('%Y-%m-%d %H:%M')}｜{row['message']}")
+    return True
+
+
+def try_handle_multiple_event_reminders(chat_id: int, text: str) -> bool:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if len(lines) <= 1:
+        return False
+
+    parsed_items = []
+    failed_lines = []
+
+    for line in lines:
+        parsed = parse_chinese_reminder(line)
+        if parsed:
+            parsed_items.append((line, parsed))
+        else:
+            failed_lines.append(line)
+
+    if not parsed_items:
+        return False
+
+    success_lines = []
+
+    for _, parsed in parsed_items:
+        event_time: datetime = parsed["event_time"]
+        message: str = parsed["message"]
+
+        replaced = False
+        duplicate = find_duplicate_event(chat_id, event_time, message)
+        if duplicate:
+            old_event_id = int(duplicate["id"])
+            remove_scheduled_jobs_for_event(old_event_id)
+            if cancel_event_by_id(old_event_id, chat_id):
+                replaced = True
+
+        result = save_event_with_notifications(chat_id, event_time, message)
+
+        for n in result["notifications"]:
+            schedule_one_notification(
+                notification_id=n["notification_id"],
+                event_id=result["event_id"],
+                chat_id=chat_id,
+                notify_time=n["notify_time"],
+                label=n["label"],
+                event_time=event_time,
+                message=message,
+            )
+
+        prefix = "✅ 已更新" if replaced else "✅ 已建立"
+        success_lines.append(f"{prefix}｜{event_time.strftime('%Y-%m-%d %H:%M')}｜{message}")
+
+    reply = ["📌 多筆提醒處理結果", ""]
+    reply.extend(success_lines)
+
+    if failed_lines:
+        reply.append("")
+        reply.append("⚠️ 下列內容未成功辨識：")
+        reply.extend(failed_lines)
+
+    send_message(chat_id, "\n".join(reply))
     return True
 
 
@@ -1303,11 +1441,27 @@ def try_handle_event_reminder(chat_id: int, text: str) -> bool:
 def handle_unknown(chat_id: int) -> None:
     msg = (
         "我目前支援：\n"
-        "/start\n/help\n/news\n/news tech\n/news business\n/weather\n/list\n/cancel 事件代碼\n\n"
-        "也可以直接輸入：\nnews\nnew\nweather\n天氣\n\n"
+        "/start\n"
+        "/help\n"
+        "/news\n"
+        "/news tech\n"
+        "/news business\n"
+        "/weather\n"
+        "/list\n"
+        "/cancel 事件代碼\n"
+        "/cancel_all\n\n"
+        "也可以直接輸入：\n"
+        "news\n"
+        "new\n"
+        "weather\n"
+        "天氣\n\n"
         "也可以直接輸入提醒，例如：\n"
-        "晚上7點半打球\n今天早上七點吃早餐\n明天晚上七點半打球\n兩小時後提醒我喝水\n\n"
-        "取消也可直接輸入：\n取消打球"
+        "晚上7點半打球\n"
+        "今天早上七點吃早餐\n"
+        "明天晚上七點半打球\n"
+        "兩小時後提醒我喝水\n\n"
+        "多筆提醒可一行一筆輸入。\n"
+        "全部取消可輸入：取消所有提醒"
     )
     send_message(chat_id, msg)
 
@@ -1379,6 +1533,30 @@ def schedule_jobs() -> None:
         misfire_grace_time=3600,
     )
 
+    try:
+        scheduler.remove_job("daily_cleanup_job")
+    except JobLookupError:
+        pass
+    except Exception as e:
+        logger.exception("Failed removing old daily_cleanup_job: %s", e)
+
+    try:
+        c_hour, c_minute = DAILY_CLEANUP_TIME.split(":")
+        scheduler.add_job(
+            cleanup_all_completed_events,
+            trigger="cron",
+            hour=int(c_hour),
+            minute=int(c_minute),
+            id="daily_cleanup_job",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=3600,
+        )
+        logger.info("Daily cleanup scheduled at %s (%s)", DAILY_CLEANUP_TIME, TIMEZONE)
+    except Exception as e:
+        logger.exception("Failed scheduling daily cleanup: %s", e)
+
     logger.info("Scheduler started. Daily news at %s (%s)", NEWS_PUSH_TIME, TIMEZONE)
     logger.info("Catch-up scan scheduled every 1 minute")
 
@@ -1392,6 +1570,7 @@ def home():
             "timezone": TIMEZONE,
             "news_push_time": NEWS_PUSH_TIME,
             "weather_push_time": WEATHER_PUSH_TIME,
+            "daily_cleanup_time": DAILY_CLEANUP_TIME,
             "owner_id_set": bool(OWNER_ID),
             "openai_model": OPENAI_MODEL,
             "chinese_summary_enabled": ENABLE_CHINESE_SUMMARY,
@@ -1438,11 +1617,17 @@ def telegram_webhook():
             handle_weather(chat_id, text if text.startswith("/weather") else "/weather")
         elif text.startswith("/list"):
             handle_list(chat_id)
+        elif text.startswith("/cancel_all"):
+            handle_cancel_all(chat_id)
         elif text.startswith("/cancel"):
             handle_cancel(chat_id, text)
         else:
             if handle_cancel_by_keyword(chat_id, text):
                 return jsonify({"ok": True})
+
+            if try_handle_multiple_event_reminders(chat_id, text):
+                return jsonify({"ok": True})
+
             if not try_handle_event_reminder(chat_id, text):
                 handle_unknown(chat_id)
 
