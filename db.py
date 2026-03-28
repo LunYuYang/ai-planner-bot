@@ -1,50 +1,41 @@
-mport os
-import psycopg2
-from psycopg2.extras import RealDictCursor
-
-DATABASE_URL = os.getenv("DATABASE_URL")
-
-if not DATABASE_URL:
-    raise RuntimeError("Missing DATABASE_URL in environment variables.")
+import sqlite3
+from config import DB_PATH
 
 
 def get_conn():
-    return psycopg2.connect(
-        DATABASE_URL,
-        cursor_factory=RealDictCursor
-    )
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 def init_db():
     conn = get_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS reminder_events (
-                id SERIAL PRIMARY KEY,
-                chat_id BIGINT,
-                event_time TIMESTAMP,
-                message TEXT,
-                keyword TEXT,
-                canceled INTEGER DEFAULT 0,
-                created_at TIMESTAMP
-            )
-            """)
 
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS reminder_notifications (
-                id SERIAL PRIMARY KEY,
-                event_id INTEGER,
-                chat_id BIGINT,
-                notify_time TIMESTAMP,
-                notify_type TEXT,
-                label TEXT,
-                sent INTEGER DEFAULT 0,
-                canceled INTEGER DEFAULT 0,
-                created_at TIMESTAMP
-            )
-            """)
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS reminder_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id INTEGER,
+        event_time TEXT,
+        message TEXT,
+        keyword TEXT,
+        canceled INTEGER DEFAULT 0,
+        created_at TEXT
+    )
+    """)
 
-        conn.commit()
-    finally:
-        conn.close()
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS reminder_notifications (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_id INTEGER,
+        chat_id INTEGER,
+        notify_time TEXT,
+        notify_type TEXT,
+        label TEXT,
+        sent INTEGER DEFAULT 0,
+        canceled INTEGER DEFAULT 0,
+        created_at TEXT
+    )
+    """)
+
+    conn.commit()
+    conn.close()
