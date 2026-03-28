@@ -1,50 +1,64 @@
 import os
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import sqlite3
+from contextlib import contextmanager
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-
-if not DATABASE_URL:
-    raise RuntimeError("Missing DATABASE_URL in environment variables.")
+DB_PATH = os.getenv("DB_PATH", "planner.db")
 
 
+@contextmanager
 def get_conn():
-    return psycopg2.connect(
-        DATABASE_URL,
-        cursor_factory=RealDictCursor
-    )
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 
 def init_db():
-    conn = get_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS reminder_events (
-                id SERIAL PRIMARY KEY,
-                chat_id BIGINT,
-                event_time TIMESTAMPTZ,
-                message TEXT,
-                keyword TEXT,
-                canceled INTEGER DEFAULT 0,
-                created_at TIMESTAMPTZ
-            )
-            """)
+    os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
 
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS reminder_notifications (
-                id SERIAL PRIMARY KEY,
-                event_id INTEGER,
-                chat_id BIGINT,
-                notify_time TIMESTAMPTZ,
-                notify_type TEXT,
-                label TEXT,
-                sent INTEGER DEFAULT 0,
-                canceled INTEGER DEFAULT 0,
-                created_at TIMESTAMPTZ
+    with get_conn() as conn:
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS reminder_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                event_time TEXT NOT NULL,
+                message TEXT NOT NULL,
+                keyword TEXT,
+                canceled INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                completed_at TEXT
             )
-            """)
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS reminder_notifications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id INTEGER NOT NULL,
+                notify_at TEXT NOT NULL,
+                offset_seconds INTEGER NOT NULL,
+                sent INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                FOREIGN KEY (event_id) REFERENCES reminder_events(id) ON DELETE CASCADE
+            )
+            """
+        )
+
+        cur.execute("PRAGMA table_info(reminder_events)")
+        event_columns = {row[1] for row in cur.fetchall()}
+        if "completed_at" not in event_columns:
+            cur.execute("ALTER TABLE reminder_events ADD COLUMN completed_at TEXT")
+
+        cur.execute("PRAGMA table_info(reminder_notifications)")
+        notification_columns = {row[1] for row in cur.fetchall()}
+        if "sent" not in notification_columns:
+            cur.execute(
+                "ALTER TABLE reminder_notifications ADD COLUMN sent INTEGER NOT NULL DEFAULT 0"
+            )
 
         conn.commit()
-    finally:
-        conn.close()
