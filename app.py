@@ -250,7 +250,10 @@ def summarize_to_chinese(title: str, raw_summary: str, source_name: str) -> str:
         resp = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[
-                {"role": "system", "content": "你是擅長整理國際科技、AI、商業與財經新聞的繁體中文編輯，輸出精簡、清楚、自然。"},
+                {
+                    "role": "system",
+                    "content": "你是擅長整理國際科技、AI、商業與財經新聞的繁體中文編輯，輸出精簡、清楚、自然。",
+                },
                 {"role": "user", "content": prompt},
             ],
             temperature=0.3,
@@ -338,14 +341,12 @@ def format_news_message(items: List[Dict[str, Any]], title: str = "今日新聞"
 def push_news_to_all(category: Optional[str] = None, limit: Optional[int] = None) -> None:
     category = (category or DEFAULT_NEWS_CATEGORY).lower().strip()
     limit = limit or DEFAULT_NEWS_LIMIT
-
     items = get_news(category, limit)
-    title = "早安，這是今天的新聞整理"
-    msg = format_news_message(items, title=title)
+    msg = format_news_message(items, title="早安，這是今天的新聞整理")
 
     for chat_id in get_all_target_chat_ids():
         try:
-            send_message(chat_id, msg)
+            send_message(chat_id, msg, disable_web_page_preview=True)
         except Exception as e:
             logger.exception("Push news failed to %s: %s", chat_id, e)
 
@@ -435,7 +436,7 @@ def push_weather_to_all(city: Optional[str] = None) -> None:
 
     for chat_id in get_all_target_chat_ids():
         try:
-            send_message(chat_id, msg)
+            send_message(chat_id, msg, disable_web_page_preview=True)
         except Exception as e:
             logger.exception("Push weather failed to %s: %s", chat_id, e)
 
@@ -497,10 +498,8 @@ def chinese_num_to_int(text: str) -> Optional[int]:
     text = text.strip()
     if not text:
         return None
-
     if text.isdigit():
         return int(text)
-
     if text == "十":
         return 10
 
@@ -745,9 +744,7 @@ def migrate_tables() -> None:
             existing_columns = {row_get(row, "column_name") for row in cur.fetchall()}
 
             if "completed_at" not in existing_columns:
-                cur.execute(
-                    "ALTER TABLE reminder_events ADD COLUMN completed_at TIMESTAMP NULL"
-                )
+                cur.execute("ALTER TABLE reminder_events ADD COLUMN completed_at TIMESTAMP NULL")
                 logger.info("Added completed_at column to reminder_events")
 
             cur.execute(
@@ -760,9 +757,7 @@ def migrate_tables() -> None:
             notification_columns = {row_get(row, "column_name") for row in cur.fetchall()}
 
             if "notify_at" not in notification_columns:
-                cur.execute(
-                    "ALTER TABLE reminder_notifications ADD COLUMN notify_at TIMESTAMP NULL"
-                )
+                cur.execute("ALTER TABLE reminder_notifications ADD COLUMN notify_at TIMESTAMP NULL")
                 logger.info("Added notify_at column to reminder_notifications")
 
             if "offset_seconds" not in notification_columns:
@@ -772,15 +767,18 @@ def migrate_tables() -> None:
                 logger.info("Added offset_seconds column to reminder_notifications")
 
             if "sent" not in notification_columns:
-                cur.execute(
-                    "ALTER TABLE reminder_notifications ADD COLUMN sent BOOLEAN NOT NULL DEFAULT FALSE"
-                )
+                cur.execute("ALTER TABLE reminder_notifications ADD COLUMN sent BOOLEAN NOT NULL DEFAULT FALSE")
                 logger.info("Added sent column to reminder_notifications")
 
         conn.commit()
 
 
-def save_event_and_notifications(chat_id: int, event_time: datetime, message: str, keyword: str) -> Tuple[int, List[Tuple[int, datetime, int]]]:
+def save_event_and_notifications(
+    chat_id: int,
+    event_time: datetime,
+    message: str,
+    keyword: str,
+) -> Tuple[int, List[Tuple[int, datetime, int]]]:
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -807,11 +805,7 @@ def save_event_and_notifications(chat_id: int, event_time: datetime, message: st
                     ON CONFLICT (event_id, offset_seconds) DO NOTHING
                     RETURNING id
                     """,
-                    (
-                        event_id,
-                        notify_at.replace(tzinfo=None),
-                        offset_seconds,
-                    ),
+                    (event_id, notify_at.replace(tzinfo=None), offset_seconds),
                 )
                 inserted = cur.fetchone()
                 if inserted:
@@ -844,7 +838,15 @@ def offset_label(offset_seconds: int) -> str:
     return "時間到"
 
 
-def schedule_single_notification(notification_id: int, event_id: int, chat_id: int, event_time: datetime, message: str, offset_seconds: int, notify_at: datetime) -> None:
+def schedule_single_notification(
+    notification_id: int,
+    event_id: int,
+    chat_id: int,
+    event_time: datetime,
+    message: str,
+    offset_seconds: int,
+    notify_at: datetime,
+) -> None:
     job_id = f"notif_{notification_id}"
     scheduler.add_job(
         send_event_notification,
@@ -907,6 +909,7 @@ def load_pending_notifications_into_scheduler() -> None:
                 JOIN reminder_events re ON rn.event_id = re.id
                 WHERE re.canceled = FALSE
                   AND rn.sent = FALSE
+                  AND rn.notify_at IS NOT NULL
                   AND rn.notify_at > %s
                 ORDER BY rn.notify_at ASC
                 """,
@@ -922,7 +925,12 @@ def load_pending_notifications_into_scheduler() -> None:
             event_time = parse_db_datetime(row_get(row, "event_time", 3))
             message = row_get(row, "message", 4, "")
             offset_seconds = int(row_get(row, "offset_seconds", 5))
-            notify_at = parse_db_datetime(row_get(row, "notify_at", 6))
+            notify_at_raw = row_get(row, "notify_at", 6)
+
+            if not notify_at_raw:
+                continue
+
+            notify_at = parse_db_datetime(notify_at_raw)
 
             schedule_single_notification(
                 notification_id=notification_id,
@@ -1184,7 +1192,14 @@ def cleanup_old_data() -> None:
     logger.info("Daily cleanup finished: deleted %s completed events", len(event_ids))
 
 
-def send_event_notification(notification_id: int, event_id: int, chat_id: int, event_time_iso: str, message: str, offset_seconds: int) -> None:
+def send_event_notification(
+    notification_id: int,
+    event_id: int,
+    chat_id: int,
+    event_time_iso: str,
+    message: str,
+    offset_seconds: int,
+) -> None:
     claimed = False
 
     try:
@@ -1204,7 +1219,7 @@ def send_event_notification(notification_id: int, event_id: int, chat_id: int, e
         else:
             text = f"提醒你（{label}）：{message}"
 
-        send_message(chat_id, text)
+        send_message(chat_id, text, disable_web_page_preview=True)
 
         if check_and_mark_event_completed(event_id):
             cleanup_completed_event(event_id)
@@ -1236,6 +1251,7 @@ def catch_up_missed_notifications() -> None:
                 JOIN reminder_events re ON rn.event_id = re.id
                 WHERE re.canceled = FALSE
                   AND rn.sent = FALSE
+                  AND rn.notify_at IS NOT NULL
                   AND rn.notify_at <= %s
                 ORDER BY rn.notify_at ASC
                 """,
@@ -1317,7 +1333,7 @@ def handle_start(chat_id: int) -> None:
         "/news 查看新聞\n"
         "/weather 查看天氣"
     )
-    send_message(chat_id, msg)
+    send_message(chat_id, msg, disable_web_page_preview=True)
 
 
 def handle_help(chat_id: int) -> None:
@@ -1340,7 +1356,7 @@ def handle_help(chat_id: int) -> None:
         "/news 查看新聞\n"
         "/weather 查看天氣"
     )
-    send_message(chat_id, msg)
+    send_message(chat_id, msg, disable_web_page_preview=True)
 
 
 def handle_news(chat_id: int, text: str) -> None:
@@ -1357,7 +1373,7 @@ def handle_news(chat_id: int, text: str) -> None:
             pass
 
     items = get_news(category, limit)
-    send_message(chat_id, format_news_message(items, title="最新新聞"))
+    send_message(chat_id, format_news_message(items, title="最新新聞"), disable_web_page_preview=True)
 
 
 def handle_weather(chat_id: int, text: str) -> None:
@@ -1371,46 +1387,44 @@ def handle_weather(chat_id: int, text: str) -> None:
     except Exception as e:
         logger.exception("handle_weather failed: %s", e)
         msg = f"天氣查詢失敗：{e}"
-    send_message(chat_id, msg)
+    send_message(chat_id, msg, disable_web_page_preview=True)
 
 
 def handle_list(chat_id: int) -> None:
     items = get_event_list(chat_id)
     if not items:
-        send_message(chat_id, "目前沒有未取消的提醒。")
+        send_message(chat_id, "目前沒有未取消的提醒。", disable_web_page_preview=True)
         return
 
     lines = ["目前提醒清單：", ""]
     for idx, item in enumerate(items, start=1):
         lines.append(format_event_line(idx, item))
-    send_message(chat_id, "\n".join(lines))
+    send_message(chat_id, "\n".join(lines), disable_web_page_preview=True)
 
 
 def handle_cancel(chat_id: int, text: str) -> None:
     parts = text.strip().split()
     if len(parts) != 2:
-        send_message(chat_id, "格式錯誤，請用 /cancel 編號，例如：/cancel 1")
+        send_message(chat_id, "格式錯誤，請用 /cancel 編號，例如：/cancel 1", disable_web_page_preview=True)
         return
 
     try:
         index = int(parts[1])
     except ValueError:
-        send_message(chat_id, "請輸入正確編號，例如：/cancel 1")
+        send_message(chat_id, "請輸入正確編號，例如：/cancel 1", disable_web_page_preview=True)
         return
 
     item = cancel_event_by_index(chat_id, index)
     if not item:
-        send_message(chat_id, "找不到該提醒。")
+        send_message(chat_id, "找不到該提醒。", disable_web_page_preview=True)
         return
 
-    send_message(chat_id, f"已取消：{item['message']}")
+    send_message(chat_id, f"已取消：{item['message']}", disable_web_page_preview=True)
 
 
 def handle_cancel_by_keyword(chat_id: int, text: str) -> bool:
     raw = text.strip()
-    patterns = [
-        r"^(取消|刪除|不要提醒我|不用提醒我)\s*(.+)$",
-    ]
+    patterns = [r"^(取消|刪除|不要提醒我|不用提醒我)\s*(.+)$"]
 
     for pattern in patterns:
         m = re.match(pattern, raw)
@@ -1419,14 +1433,14 @@ def handle_cancel_by_keyword(chat_id: int, text: str) -> bool:
 
         keyword = m.group(2).strip()
         if not keyword:
-            send_message(chat_id, "請補上要取消的提醒內容。")
+            send_message(chat_id, "請補上要取消的提醒內容。", disable_web_page_preview=True)
             return True
 
         item = cancel_event_by_keyword(chat_id, keyword)
         if item:
-            send_message(chat_id, f"已取消：{item['message']}")
+            send_message(chat_id, f"已取消：{item['message']}", disable_web_page_preview=True)
         else:
-            send_message(chat_id, "找不到符合的提醒。")
+            send_message(chat_id, "找不到符合的提醒。", disable_web_page_preview=True)
         return True
 
     return False
@@ -1450,7 +1464,7 @@ def try_handle_event_reminder(chat_id: int, text: str) -> bool:
     if len(created_items) == 1 and not failed_items:
         item = created_items[0]
         event_time = item["event_time"].strftime("%m/%d %H:%M")
-        send_message(chat_id, f"已新增提醒：{event_time} {item['message']}")
+        send_message(chat_id, f"已新增提醒：{event_time} {item['message']}", disable_web_page_preview=True)
         return True
 
     lines.append(f"已新增 {len(created_items)} 筆提醒：")
@@ -1465,7 +1479,7 @@ def try_handle_event_reminder(chat_id: int, text: str) -> bool:
         for idx, raw in failed_items:
             lines.append(f"- 第{idx}筆：{raw}")
 
-    send_message(chat_id, "\n".join(lines))
+    send_message(chat_id, "\n".join(lines), disable_web_page_preview=True)
     return True
 
 
@@ -1481,7 +1495,7 @@ def handle_unknown(chat_id: int) -> None:
         "明天下午3點開會\n"
         "明天晚上7點打球"
     )
-    send_message(chat_id, msg)
+    send_message(chat_id, msg, disable_web_page_preview=True)
 
 
 def schedule_jobs() -> None:
@@ -1617,11 +1631,19 @@ def bootstrap() -> None:
 
     try:
         schedule_jobs()
+    except Exception as e:
+        logger.exception("schedule_jobs failed: %s", e)
+
+    try:
         load_pending_notifications_into_scheduler()
         catch_up_missed_notifications()
+    except Exception as e:
+        logger.exception("load/catch_up failed: %s", e)
+
+    try:
         cleanup_old_data()
     except Exception as e:
-        logger.exception("scheduler bootstrap failed: %s", e)
+        logger.exception("cleanup failed: %s", e)
 
 
 bootstrap()
