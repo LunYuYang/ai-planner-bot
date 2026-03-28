@@ -23,11 +23,11 @@ def init_db():
             CREATE TABLE IF NOT EXISTS reminder_events (
                 id SERIAL PRIMARY KEY,
                 chat_id BIGINT,
-                event_time TIMESTAMP,
+                event_time TIMESTAMPTZ,
                 message TEXT,
                 keyword TEXT,
                 canceled INTEGER DEFAULT 0,
-                created_at TIMESTAMP
+                created_at TIMESTAMPTZ
             )
             """)
 
@@ -36,13 +36,33 @@ def init_db():
                 id SERIAL PRIMARY KEY,
                 event_id INTEGER,
                 chat_id BIGINT,
-                notify_time TIMESTAMP,
+                notify_time TIMESTAMPTZ,
                 notify_type TEXT,
                 label TEXT,
                 sent INTEGER DEFAULT 0,
                 canceled INTEGER DEFAULT 0,
-                created_at TIMESTAMP
+                created_at TIMESTAMPTZ
             )
+            """)
+
+            cur.execute("""
+            ALTER TABLE reminder_events
+            ALTER COLUMN event_time TYPE TIMESTAMPTZ USING event_time AT TIME ZONE 'Asia/Taipei'
+            """)
+
+            cur.execute("""
+            ALTER TABLE reminder_events
+            ALTER COLUMN created_at TYPE TIMESTAMPTZ USING created_at AT TIME ZONE 'Asia/Taipei'
+            """)
+
+            cur.execute("""
+            ALTER TABLE reminder_notifications
+            ALTER COLUMN notify_time TYPE TIMESTAMPTZ USING notify_time AT TIME ZONE 'Asia/Taipei'
+            """)
+
+            cur.execute("""
+            ALTER TABLE reminder_notifications
+            ALTER COLUMN created_at TYPE TIMESTAMPTZ USING created_at AT TIME ZONE 'Asia/Taipei'
             """)
 
         conn.commit()
