@@ -720,8 +720,12 @@ def food_mode_title(mode: str) -> str:
     }.get(mode, "美食")
 
 
-def google_maps_place_link(place_id: str) -> str:
-    return f"https://www.google.com/maps/place/?q=place_id:{place_id}"
+from urllib.parse import quote
+
+def google_maps_place_link(place_id: str, name: str = "") -> str:
+    if name:
+        return f"https://www.google.com/maps/search/?api=1&query={quote(name)}&query_place_id={place_id}"
+    return f"https://www.google.com/maps/search/?api=1&query=Google&query_place_id={place_id}"
 
 
 def search_nearby_places(lat: float, lng: float, mode: str, radius_meters: int, minprice: Optional[int], maxprice: Optional[int]) -> List[Dict[str, Any]]:
@@ -775,7 +779,7 @@ def search_nearby_places(lat: float, lng: float, mode: str, radius_meters: int, 
                     "address": item.get("vicinity") or item.get("formatted_address") or "",
                     "place_id": place_id,
                     "types": item.get("types") or [],
-                    "maps_link": google_maps_place_link(place_id),
+                    "maps_link": google_maps_place_link(place_id, name),
                 })
         except Exception as e:
             logger.exception("Nearby food search failed for keyword=%s: %s", keyword, e)
