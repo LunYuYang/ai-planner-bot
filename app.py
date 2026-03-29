@@ -7,6 +7,7 @@ from pathlib import Path
 from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional, Tuple
+from urllib.parse import quote
 
 import requests
 import feedparser
@@ -720,7 +721,6 @@ def food_mode_title(mode: str) -> str:
     }.get(mode, "美食")
 
 
-from urllib.parse import quote
 
 def google_maps_place_link(place_id: str, name: str = "") -> str:
     if name:
