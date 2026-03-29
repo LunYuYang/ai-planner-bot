@@ -1,0 +1,28 @@
+name: Deploy to VM
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VM_HOST }}
+          username: ${{ secrets.VM_USER }}
+          key: ${{ secrets.VM_SSH_KEY }}
+          script: |
+            set -e
+            cd ~/ai-planner-bot
+            git fetch origin
+            git reset --hard origin/main
+            source venv/bin/activate
+            export $(cat .env | xargs)
+            sudo systemctl restart tg-bot
+            sudo systemctl status tg-bot --no-pager
