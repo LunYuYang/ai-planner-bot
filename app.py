@@ -3,6 +3,7 @@ import re
 import json
 import html
 import logging
+from pathlib import Path
 from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional, Tuple
@@ -44,7 +45,9 @@ CWA_API_KEY = os.getenv("CWA_API_KEY", "").strip()
 DEFAULT_WEATHER_CITY = os.getenv("DEFAULT_WEATHER_CITY", "臺南市").strip()
 WEATHER_PUSH_TIME = os.getenv("WEATHER_PUSH_TIME", "").strip()
 DAILY_CLEANUP_TIME = os.getenv("DAILY_CLEANUP_TIME", "03:30").strip()
+GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY", "").strip()
 
+PENDING_FOOD_FILE = os.path.join(DATA_DIR, "pending_food_requests.json")
 
 WEATHER_CITY_ALIASES = {
     "臺北市": ["臺北市", "台北市", "臺北", "台北", "taipei", "taipei city"],
@@ -520,6 +523,406 @@ def is_weather_query(text: str) -> bool:
 def extract_weather_city(text: str) -> str:
     raw = (text or "").strip()
     return resolve_weather_city(raw) or DEFAULT_WEATHER_CITY
+
+
+def normalize_food_text(text: str) -> str:
+    text = (text or "").strip().lower()
+    text = text.replace("　", " ")
+    text = text.replace("臺", "台")
+    text = re.sub(r"\s+", "", text)
+    return text
+
+
+FOOD_KEYWORDS = {
+    "breakfast": ["早餐", "早午餐", "brunch", "breakfast", "morning food"],
+    "lunch": ["午餐", "中餐", "午飯", "lunch"],
+    "dinner": ["晚餐", "dinner", "supper"],
+    "late_night": ["宵夜", "消夜", "late night", "midnight food", "midnight snack"],
+    "snack": ["小吃", "麵店", "面店", "noodle", "snack"],
+    "fine_dining": ["高級餐廳", "高級料理", "fine dining", "restaurant", "約會餐廳"],
+    "generic": ["美食", "餐廳", "吃飯", "food", "eat", "dining"],
+}
+
+FOOD_TRIGGER_PATTERNS = [kw for kws in FOOD_KEYWORDS.values() for kw in kws] + [
+    "附近美食", "附近早餐", "附近午餐", "附近晚餐", "附近宵夜", "nearby food", "nearby breakfast",
+    "nearby lunch", "nearby dinner", "nearby late night"
+]
+
+DEFAULT_FOOD_RADIUS_METERS = 8000
+DEFAULT_FOOD_LIMIT = 6
+DEFAULT_FOOD_MIN_RATING = 4.5
+
+
+def load_pending_food_requests() -> Dict[str, Any]:
+    if not os.path.exists(PENDING_FOOD_FILE):
+        return {}
+    try:
+        return json.loads(Path(PENDING_FOOD_FILE).read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.exception("Failed to load pending food requests: %s", e)
+        return {}
+
+
+def save_pending_food_requests(data: Dict[str, Any]) -> None:
+    try:
+        Path(PENDING_FOOD_FILE).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        logger.exception("Failed to save pending food requests: %s", e)
+
+
+def set_pending_food_request(chat_id: int, payload: Dict[str, Any]) -> None:
+    data = load_pending_food_requests()
+    data[str(chat_id)] = payload
+    save_pending_food_requests(data)
+
+
+def get_pending_food_request(chat_id: int) -> Optional[Dict[str, Any]]:
+    return load_pending_food_requests().get(str(chat_id))
+
+
+def clear_pending_food_request(chat_id: int) -> None:
+    data = load_pending_food_requests()
+    if str(chat_id) in data:
+        data.pop(str(chat_id), None)
+        save_pending_food_requests(data)
+
+
+def is_food_query(text: str) -> bool:
+    normalized = normalize_food_text(text)
+    if not normalized:
+        return False
+    if normalized.startswith("/food"):
+        return True
+    return any(normalize_food_text(token) in normalized for token in FOOD_TRIGGER_PATTERNS)
+
+
+def detect_food_mode(text: str) -> str:
+    normalized = normalize_food_text(text)
+    priority = ["breakfast", "lunch", "dinner", "late_night", "snack", "fine_dining", "generic"]
+    for mode in priority:
+        for kw in FOOD_KEYWORDS[mode]:
+            if normalize_food_text(kw) in normalized:
+                return mode
+    return "generic"
+
+
+def parse_distance_meters(text: str) -> int:
+    m = re.search(r"(\d+(?:\.\d+)?)\s*(公里|km|KM)", text or "", re.IGNORECASE)
+    if not m:
+        return DEFAULT_FOOD_RADIUS_METERS
+    km = float(m.group(1))
+    km = max(0.5, min(20.0, km))
+    return int(km * 1000)
+
+
+def parse_budget_twd(text: str) -> Dict[str, Optional[int]]:
+    raw = (text or "").replace(",", "")
+    m = re.search(r"(\d{2,5})\s*[~～\-到至]\s*(\d{2,5})", raw)
+    if m:
+        low, high = int(m.group(1)), int(m.group(2))
+        if low > high:
+            low, high = high, low
+        return {"min_twd": low, "max_twd": high}
+
+    m = re.search(r"(\d{2,5})\s*(以下|以內|內|under)", raw, re.IGNORECASE)
+    if m:
+        return {"min_twd": None, "max_twd": int(m.group(1))}
+
+    m = re.search(r"(\d{2,5})\s*(以上|起|up)", raw, re.IGNORECASE)
+    if m:
+        return {"min_twd": int(m.group(1)), "max_twd": None}
+
+    return {"min_twd": None, "max_twd": None}
+
+
+def twd_to_google_price_level(value: Optional[int], is_max: bool = False) -> Optional[int]:
+    if value is None:
+        return None
+    if value <= 150:
+        return 0
+    if value <= 400:
+        return 1
+    if value <= 900:
+        return 2
+    if value <= 1800:
+        return 3
+    return 4
+
+
+def parse_price_levels(text: str) -> Dict[str, Optional[int]]:
+    budget = parse_budget_twd(text)
+    return {
+        "minprice": twd_to_google_price_level(budget.get("min_twd"), is_max=False),
+        "maxprice": twd_to_google_price_level(budget.get("max_twd"), is_max=True),
+        "budget": budget,
+    }
+
+
+def detect_explicit_location(text: str) -> Tuple[Optional[str], Optional[Tuple[float, float]]]:
+    canonical = resolve_weather_city(text)
+    if canonical and canonical in WEATHER_CITY_COORDS:
+        return canonical, WEATHER_CITY_COORDS[canonical]
+    return None, None
+
+
+def parse_food_query(text: str) -> Dict[str, Any]:
+    mode = detect_food_mode(text)
+    radius_meters = parse_distance_meters(text)
+    price_info = parse_price_levels(text)
+    explicit_city, coords = detect_explicit_location(text)
+
+    if explicit_city and coords:
+        requires_location = False
+        location_label = explicit_city
+    else:
+        requires_location = True
+        location_label = None
+
+    return {
+        "mode": mode,
+        "radius_meters": radius_meters,
+        "minprice": price_info["minprice"],
+        "maxprice": price_info["maxprice"],
+        "budget": price_info["budget"],
+        "explicit_city": explicit_city,
+        "coords": coords,
+        "requires_location": requires_location,
+        "raw_text": text.strip(),
+        "location_label": location_label,
+    }
+
+
+def build_food_keyword_groups(mode: str) -> List[str]:
+    if mode == "breakfast":
+        return ["早餐", "早午餐", "breakfast", "brunch"]
+    if mode == "lunch":
+        return ["午餐", "lunch", "便當", "餐廳"]
+    if mode == "dinner":
+        return ["晚餐", "dinner", "餐廳", "燒肉", "火鍋"]
+    if mode == "late_night":
+        return ["宵夜", "消夜", "late night food", "night market food"]
+    if mode == "snack":
+        return ["小吃", "麵店", "noodle", "street food"]
+    if mode == "fine_dining":
+        return ["fine dining", "高級餐廳", "牛排館", "omakase"]
+    return ["美食", "小吃", "麵店", "restaurant", "fine dining"]
+
+
+def food_mode_title(mode: str) -> str:
+    return {
+        "breakfast": "早餐 / 早午餐",
+        "lunch": "午餐",
+        "dinner": "晚餐",
+        "late_night": "宵夜",
+        "snack": "小吃 / 麵店",
+        "fine_dining": "高級餐廳",
+        "generic": "美食",
+    }.get(mode, "美食")
+
+
+def google_maps_place_link(place_id: str) -> str:
+    return f"https://www.google.com/maps/place/?q=place_id:{place_id}"
+
+
+def search_nearby_places(lat: float, lng: float, mode: str, radius_meters: int, minprice: Optional[int], maxprice: Optional[int]) -> List[Dict[str, Any]]:
+    if not GOOGLE_MAPS_API_KEY:
+        return []
+
+    endpoint = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
+    groups = build_food_keyword_groups(mode)
+    seen = set()
+    results: List[Dict[str, Any]] = []
+    fine_count = 0
+
+    for keyword in groups:
+        params = {
+            "key": GOOGLE_MAPS_API_KEY,
+            "location": f"{lat},{lng}",
+            "radius": radius_meters,
+            "keyword": keyword,
+            "language": "zh-TW",
+        }
+        if minprice is not None:
+            params["minprice"] = minprice
+        if maxprice is not None:
+            params["maxprice"] = maxprice
+
+        try:
+            resp = requests.get(endpoint, params=params, timeout=HTTP_TIMEOUT)
+            resp.raise_for_status()
+            payload = resp.json()
+            for item in payload.get("results", []):
+                place_id = item.get("place_id")
+                rating = float(item.get("rating") or 0)
+                if not place_id or place_id in seen or rating < DEFAULT_FOOD_MIN_RATING:
+                    continue
+
+                price_level = item.get("price_level")
+                name = item.get("name", "未知店家")
+                lowered = normalize_food_text(name)
+                is_fine = price_level is not None and int(price_level) >= 3 or any(x in lowered for x in ["fine", "omakase", "牛排", "鐵板燒", "法式", "無菜單"])
+                if mode == "generic" and is_fine:
+                    if fine_count >= 2:
+                        continue
+                    fine_count += 1
+
+                seen.add(place_id)
+                results.append({
+                    "name": name,
+                    "rating": rating,
+                    "user_ratings_total": int(item.get("user_ratings_total") or 0),
+                    "price_level": price_level,
+                    "address": item.get("vicinity") or item.get("formatted_address") or "",
+                    "place_id": place_id,
+                    "types": item.get("types") or [],
+                    "maps_link": google_maps_place_link(place_id),
+                })
+        except Exception as e:
+            logger.exception("Nearby food search failed for keyword=%s: %s", keyword, e)
+
+    results.sort(key=lambda x: (x["rating"], x["user_ratings_total"]), reverse=True)
+    return results[:DEFAULT_FOOD_LIMIT]
+
+
+def format_price_level(level: Any) -> str:
+    try:
+        level = int(level)
+    except Exception:
+        return "價格未知"
+    mapping = {0: "$", 1: "$$", 2: "$$$", 3: "$$$$", 4: "$$$$$"}
+    return mapping.get(level, "價格未知")
+
+
+def format_budget_hint(budget: Dict[str, Optional[int]]) -> str:
+    low = budget.get("min_twd")
+    high = budget.get("max_twd")
+    if low and high:
+        return f"預算：約 NT${low}~{high}"
+    if high:
+        return f"預算：NT${high} 以下"
+    if low:
+        return f"預算：NT${low} 以上"
+    return "預算：不限"
+
+
+def format_food_results_message(mode: str, location_label: str, radius_meters: int, budget: Dict[str, Optional[int]], places: List[Dict[str, Any]]) -> str:
+    title = food_mode_title(mode)
+    if not places:
+        return (
+            f"🍽️ {location_label} {title}推薦\n"
+            f"範圍：約 {radius_meters // 1000} 公里｜{format_budget_hint(budget)}\n\n"
+            "目前找不到符合條件（評分 4.5 以上）的店家，可以放寬價格或距離再試一次。"
+        )
+
+    lines = [
+        f"🍽️ {location_label} {title}推薦",
+        f"範圍：約 {radius_meters // 1000} 公里｜{format_budget_hint(budget)}",
+        "篩選：Google 評分 4.5 以上",
+        "",
+    ]
+    for idx, item in enumerate(places, start=1):
+        lines.append(f"{idx}. {item['name']}")
+        lines.append(f"評分：{item['rating']:.1f}（{item['user_ratings_total']} 則）｜{format_price_level(item.get('price_level'))}")
+        if item.get("address"):
+            lines.append(f"地址：{item['address']}")
+        lines.append(item["maps_link"])
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def send_location_request_for_food(chat_id: int, query_info: Dict[str, Any]) -> None:
+    set_pending_food_request(chat_id, query_info)
+    title = food_mode_title(query_info.get("mode", "generic"))
+    km = max(1, round(query_info.get("radius_meters", DEFAULT_FOOD_RADIUS_METERS) / 1000))
+    budget_hint = format_budget_hint(query_info.get("budget") or {"min_twd": None, "max_twd": None})
+    payload = {
+        "chat_id": chat_id,
+        "text": (
+            f"📍 這次要找 {title}。\n"
+            f"目前沒有指定城市，我需要你的定位來查附近約 {km} 公里內的店家。\n"
+            f"{budget_hint}｜篩選 Google 評分 4.5 以上\n\n"
+            "請按下方按鈕分享目前位置。"
+        ),
+        "reply_markup": {
+            "keyboard": [[{"text": "📍 分享目前位置", "request_location": True}]],
+            "resize_keyboard": True,
+            "one_time_keyboard": True,
+        },
+    }
+    telegram_api("sendMessage", payload)
+
+
+def handle_food_location_message(chat_id: int, location: Dict[str, Any]) -> None:
+    pending = get_pending_food_request(chat_id)
+    if not pending:
+        send_message(chat_id, "已收到定位，但目前沒有待查詢的美食需求。可以直接輸入像是：附近美食、早餐、晚餐。")
+        return
+
+    lat = float(location.get("latitude"))
+    lng = float(location.get("longitude"))
+    places = search_nearby_places(
+        lat=lat,
+        lng=lng,
+        mode=pending.get("mode", "generic"),
+        radius_meters=int(pending.get("radius_meters", DEFAULT_FOOD_RADIUS_METERS)),
+        minprice=pending.get("minprice"),
+        maxprice=pending.get("maxprice"),
+    )
+    clear_pending_food_request(chat_id)
+    payload = {"remove_keyboard": True}
+    try:
+        telegram_api("sendMessage", {
+            "chat_id": chat_id,
+            "text": format_food_results_message(
+                pending.get("mode", "generic"),
+                "你附近",
+                int(pending.get("radius_meters", DEFAULT_FOOD_RADIUS_METERS)),
+                pending.get("budget") or {"min_twd": None, "max_twd": None},
+                places,
+            ),
+            "reply_markup": payload,
+            "disable_web_page_preview": True,
+        })
+    except Exception:
+        send_message(chat_id, format_food_results_message(
+            pending.get("mode", "generic"),
+            "你附近",
+            int(pending.get("radius_meters", DEFAULT_FOOD_RADIUS_METERS)),
+            pending.get("budget") or {"min_twd": None, "max_twd": None},
+            places,
+        ))
+
+
+def handle_food(chat_id: int, text: str) -> None:
+    register_chat_id(chat_id)
+    if not GOOGLE_MAPS_API_KEY:
+        send_message(chat_id, "目前尚未設定 GOOGLE_MAPS_API_KEY，所以還不能查美食地圖。")
+        return
+
+    query = parse_food_query(text)
+    if query["requires_location"]:
+        send_location_request_for_food(chat_id, query)
+        return
+
+    lat, lng = query["coords"]
+    places = search_nearby_places(
+        lat=lat,
+        lng=lng,
+        mode=query["mode"],
+        radius_meters=query["radius_meters"],
+        minprice=query["minprice"],
+        maxprice=query["maxprice"],
+    )
+    send_message(
+        chat_id,
+        format_food_results_message(
+            query["mode"],
+            query["location_label"] or "指定地點",
+            query["radius_meters"],
+            query["budget"],
+            places,
+        ),
+    )
 
 
 def start_of_week(date_obj) -> datetime.date:
@@ -1815,6 +2218,7 @@ def handle_start(chat_id: int) -> None:
         "/news tech\n"
         "/news business\n"
         "/weather\n"
+        "附近美食（會要求定位）\n"
         "/list\n"
         "/cancel 事件代碼\n"
         "/cancel_all\n"
@@ -1837,6 +2241,9 @@ def handle_help(chat_id: int) -> None:
         "下週五天氣\n"
         "桃園下週六日天氣\n"
         "3/30~4/5 天氣\n"
+        "附近美食（會要求定位）\n"
+        "早餐 200以下（會要求定位）\n"
+        "台南晚餐 500~1000 3公里\n"
         "/list\n"
         "/cancel 事件代碼\n"
         "/cancel_all\n\n"
@@ -2064,6 +2471,7 @@ def handle_unknown(chat_id: int) -> None:
         "/news tech\n"
         "/news business\n"
         "/weather\n"
+        "附近美食（會要求定位）\n"
         "/list\n"
         "/cancel 事件代碼\n"
         "/cancel_all\n\n"
@@ -2075,7 +2483,9 @@ def handle_unknown(chat_id: int) -> None:
         "桃園天氣\n"
         "下週五天氣\n"
         "桃園下週六日天氣\n"
-        "3/30~4/5 天氣\n\n"
+        "3/30~4/5 天氣\n"
+        "美食 / 小吃 / 早餐 / 午餐 / 晚餐 / 宵夜（沒寫地點會要求定位）\n"
+        "台南晚餐 500~1000 3公里\n\n"
         "也可以直接輸入提醒，例如：\n"
         "晚上7點半打球\n"
         "今天早上七點吃早餐\n"
@@ -2197,6 +2607,7 @@ def home():
             "chinese_summary_enabled": ENABLE_CHINESE_SUMMARY,
             "weather_city": DEFAULT_WEATHER_CITY,
             "weather_enabled": bool(CWA_API_KEY),
+            "food_enabled": bool(GOOGLE_MAPS_API_KEY),
         }
     )
 
@@ -2216,12 +2627,16 @@ def telegram_webhook():
             return jsonify({"ok": True})
 
         chat_id = int(message["chat"]["id"])
-        text = (message.get("text") or "").strip()
 
         if OWNER_ID and chat_id != OWNER_ID:
             logger.info("Blocked non-owner: %s", chat_id)
             return jsonify({"ok": True})
 
+        if message.get("location"):
+            handle_food_location_message(chat_id, message["location"])
+            return jsonify({"ok": True})
+
+        text = (message.get("text") or "").strip()
         if not text:
             return jsonify({"ok": True})
 
@@ -2234,6 +2649,8 @@ def telegram_webhook():
             handle_help(chat_id)
         elif text.startswith("/news") or lowered in ("news", "new"):
             handle_news(chat_id, text if text.startswith("/news") else "/news")
+        elif is_food_query(text):
+            handle_food(chat_id, text)
         elif is_weather_query(text):
             handle_weather(chat_id, text)
         elif text.startswith("/list"):
