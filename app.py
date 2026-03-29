@@ -549,9 +549,11 @@ FOOD_TRIGGER_PATTERNS = [kw for kws in FOOD_KEYWORDS.values() for kw in kws] + [
     "nearby lunch", "nearby dinner", "nearby late night"
 ]
 
-DEFAULT_FOOD_RADIUS_METERS = 8000
-DEFAULT_FOOD_LIMIT = 6
+DEFAULT_FOOD_RADIUS_METERS = 3000
+DEFAULT_FOOD_LIMIT = 5
 DEFAULT_FOOD_MIN_RATING = 4.5
+DEFAULT_FOOD_MAX_RATING = 4.8
+DEFAULT_FOOD_MIN_REVIEWS = 50
 
 
 def load_pending_food_requests() -> Dict[str, Any]:
@@ -758,7 +760,14 @@ def search_nearby_places(lat: float, lng: float, mode: str, radius_meters: int, 
             for item in payload.get("results", []):
                 place_id = item.get("place_id")
                 rating = float(item.get("rating") or 0)
-                if not place_id or place_id in seen or rating < DEFAULT_FOOD_MIN_RATING:
+                user_ratings_total = int(item.get("user_ratings_total") or 0)
+                if (
+                    not place_id
+                    or place_id in seen
+                    or rating < DEFAULT_FOOD_MIN_RATING
+                    or rating > DEFAULT_FOOD_MAX_RATING
+                    or user_ratings_total < DEFAULT_FOOD_MIN_REVIEWS
+                ):
                     continue
 
                 price_level = item.get("price_level")
@@ -774,13 +783,17 @@ def search_nearby_places(lat: float, lng: float, mode: str, radius_meters: int, 
                 results.append({
                     "name": name,
                     "rating": rating,
-                    "user_ratings_total": int(item.get("user_ratings_total") or 0),
+                    "user_ratings_total": user_ratings_total,
                     "price_level": price_level,
                     "address": item.get("vicinity") or item.get("formatted_address") or "",
                     "place_id": place_id,
                     "types": item.get("types") or [],
                     "maps_link": google_maps_place_link(place_id, name),
                 })
+
+                if len(results) >= DEFAULT_FOOD_LIMIT:
+                    results.sort(key=lambda x: (x["rating"], x["user_ratings_total"]), reverse=True)
+                    return results
         except Exception as e:
             logger.exception("Nearby food search failed for keyword=%s: %s", keyword, e)
 
@@ -815,13 +828,13 @@ def format_food_results_message(mode: str, location_label: str, radius_meters: i
         return (
             f"🍽️ {location_label} {title}推薦\n"
             f"範圍：約 {radius_meters // 1000} 公里｜{format_budget_hint(budget)}\n\n"
-            "目前找不到符合條件（評分 4.5 以上）的店家，可以放寬價格或距離再試一次。"
+            f"目前找不到符合條件的店家。\n條件：評分 {DEFAULT_FOOD_MIN_RATING}~{DEFAULT_FOOD_MAX_RATING}、評論數 {DEFAULT_FOOD_MIN_REVIEWS}+。\n可以放寬價格或距離再試一次。"
         )
 
     lines = [
         f"🍽️ {location_label} {title}推薦",
         f"範圍：約 {radius_meters // 1000} 公里｜{format_budget_hint(budget)}",
-        "篩選：Google 評分 4.5 以上",
+        f"篩選：Google 評分 {DEFAULT_FOOD_MIN_RATING}~{DEFAULT_FOOD_MAX_RATING}｜評論數 {DEFAULT_FOOD_MIN_REVIEWS}+",
         "",
     ]
     for idx, item in enumerate(places, start=1):
