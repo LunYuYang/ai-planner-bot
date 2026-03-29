@@ -3,8 +3,9 @@ import re
 import json
 import html
 import logging
+from collections import defaultdict
 from datetime import datetime, timedelta
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 import requests
 import feedparser
@@ -684,6 +685,16 @@ def parse_chinese_reminder(text: str) -> Optional[Dict[str, Any]]:
     return parse_relative_reminder(text) or parse_absolute_reminder(text)
 
 
+def notification_job_id(notification_id: int) -> str:
+    return f"notify_{notification_id}"
+
+
+def build_notification_text(label: str, event_time: datetime, message: str, event_id: int) -> str:
+    if label == "- 1小時前":
+        return f"⏰ 提醒通知\n還有1小時：{event_time.strftime('%Y-%m-%d %H:%M')}｜{message}"
+    return f"⏰ 提醒通知\n現在時間到：{event_time.strftime('%Y-%m-%d %H:%M')}｜{message}"
+
+
 def get_notification_ids_by_event(event_id: int) -> List[int]:
     conn = get_conn()
     try:
@@ -707,9 +718,8 @@ def is_notification_active(notification_id: int) -> bool:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT rn.sent, rn.canceled, re.canceled AS event_canceled
+                SELECT rn.sent
                 FROM reminder_notifications rn
-                JOIN reminder_events re ON rn.event_id = re.id
                 WHERE rn.id = %s
                 """,
                 (notification_id,)
@@ -717,7 +727,7 @@ def is_notification_active(notification_id: int) -> bool:
             row = cur.fetchone()
             if not row:
                 return False
-            return int(row["sent"]) == 0 and int(row["canceled"]) == 0 and int(row["event_canceled"]) == 0
+            return int(row["sent"]) == 0
     finally:
         conn.close()
 
@@ -732,7 +742,6 @@ def find_duplicate_event(chat_id: int, event_time: datetime, message: str) -> Op
                 FROM reminder_events
                 WHERE chat_id = %s
                   AND event_time = %s
-                  AND canceled = 0
                 ORDER BY id DESC
                 """,
                 (chat_id, event_time)
@@ -819,7 +828,7 @@ def get_pending_notifications() -> List[Dict[str, Any]]:
                     re.message
                 FROM reminder_notifications rn
                 JOIN reminder_events re ON rn.event_id = re.id
-                WHERE rn.sent = 0 AND rn.canceled = 0 AND re.canceled = 0
+                WHERE rn.sent = 0
                 ORDER BY rn.notify_time ASC
                 """
             )
@@ -846,8 +855,6 @@ def get_due_unsent_notifications() -> List[Dict[str, Any]]:
                 FROM reminder_notifications rn
                 JOIN reminder_events re ON rn.event_id = re.id
                 WHERE rn.sent = 0
-                  AND rn.canceled = 0
-                  AND re.canceled = 0
                   AND rn.notify_time <= %s
                 ORDER BY rn.notify_time ASC
                 """,
@@ -873,14 +880,74 @@ def get_user_pending_events(chat_id: int) -> List[Dict[str, Any]]:
                 JOIN reminder_notifications rn
                   ON rn.event_id = re.id
                 WHERE re.chat_id = %s
-                  AND re.canceled = 0
-                  AND rn.canceled = 0
                   AND rn.sent = 0
-                ORDER BY re.event_time ASC
+                ORDER BY re.event_time ASC, re.id ASC
                 """,
                 (chat_id,)
             )
             return cur.fetchall()
+    finally:
+        conn.close()
+
+
+def delete_event_by_id(event_id: int, chat_id: int) -> bool:
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id
+                FROM reminder_events
+                WHERE id = %s AND chat_id = %s
+                """,
+                (event_id, chat_id)
+            )
+            row = cur.fetchone()
+            if not row:
+                conn.commit()
+                return False
+
+            cur.execute("DELETE FROM reminder_notifications WHERE event_id = %s", (event_id,))
+            cur.execute("DELETE FROM reminder_events WHERE id = %s AND chat_id = %s", (event_id, chat_id))
+
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+def delete_all_events(chat_id: int) -> int:
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id
+                FROM reminder_events
+                WHERE chat_id = %s
+                """,
+                (chat_id,)
+            )
+            rows = cur.fetchall()
+            event_ids = [int(row["id"]) for row in rows]
+
+            if not event_ids:
+                conn.commit()
+                return 0
+
+            cur.execute(
+                """
+                DELETE FROM reminder_notifications
+                WHERE event_id IN (
+                    SELECT id FROM reminder_events WHERE chat_id = %s
+                )
+                """,
+                (chat_id,)
+            )
+            cur.execute("DELETE FROM reminder_events WHERE chat_id = %s", (chat_id,))
+
+        conn.commit()
+        return len(event_ids)
     finally:
         conn.close()
 
@@ -896,28 +963,18 @@ def cleanup_all_completed_events() -> None:
                 FROM reminder_events re
                 LEFT JOIN reminder_notifications rn
                   ON rn.event_id = re.id
-                 AND rn.canceled = 0
                  AND rn.sent = 0
                 WHERE rn.id IS NULL
-                  AND (
-                        re.canceled = 1
-                        OR re.event_time <= %s
-                      )
+                   OR re.event_time <= %s
                 """,
                 (now_dt,)
             )
             rows = cur.fetchall()
 
-            for row in rows:
-                event_id = int(row["id"])
-                cur.execute(
-                    "DELETE FROM reminder_notifications WHERE event_id = %s",
-                    (event_id,)
-                )
-                cur.execute(
-                    "DELETE FROM reminder_events WHERE id = %s",
-                    (event_id,)
-                )
+            event_ids = [int(row["id"]) for row in rows]
+            if event_ids:
+                cur.execute("DELETE FROM reminder_notifications WHERE event_id = ANY(%s)", (event_ids,))
+                cur.execute("DELETE FROM reminder_events WHERE id = ANY(%s)", (event_ids,))
 
         conn.commit()
         logger.info("Daily cleanup finished. cleaned=%s", len(rows))
@@ -938,82 +995,6 @@ def mark_notification_sent(notification_id: int) -> None:
         conn.close()
 
 
-def cancel_event_by_id(event_id: int, chat_id: int) -> bool:
-    conn = get_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE reminder_events
-                SET canceled = 1
-                WHERE id = %s AND chat_id = %s AND canceled = 0
-                """,
-                (event_id, chat_id)
-            )
-            if cur.rowcount <= 0:
-                conn.commit()
-                return False
-
-            cur.execute(
-                """
-                UPDATE reminder_notifications
-                SET canceled = 1
-                WHERE event_id = %s
-                """,
-                (event_id,)
-            )
-
-        conn.commit()
-        return True
-    finally:
-        conn.close()
-
-
-def cancel_all_events(chat_id: int) -> int:
-    conn = get_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT id
-                FROM reminder_events
-                WHERE chat_id = %s
-                  AND canceled = 0
-                """,
-                (chat_id,)
-            )
-            rows = cur.fetchall()
-            event_ids = [int(row["id"]) for row in rows]
-
-            if not event_ids:
-                conn.commit()
-                return 0
-
-            cur.execute(
-                """
-                UPDATE reminder_events
-                SET canceled = 1
-                WHERE chat_id = %s
-                  AND canceled = 0
-                """,
-                (chat_id,)
-            )
-
-            cur.execute(
-                """
-                UPDATE reminder_notifications
-                SET canceled = 1
-                WHERE event_id = ANY(%s)
-                """,
-                (event_ids,)
-            )
-
-        conn.commit()
-        return len(event_ids)
-    finally:
-        conn.close()
-
-
 def find_latest_event_by_keyword(chat_id: int, keyword: str) -> Optional[Dict[str, Any]]:
     conn = get_conn()
     try:
@@ -1023,7 +1004,6 @@ def find_latest_event_by_keyword(chat_id: int, keyword: str) -> Optional[Dict[st
                 SELECT id, event_time, message, keyword
                 FROM reminder_events
                 WHERE chat_id = %s
-                  AND canceled = 0
                   AND (
                         lower(message) LIKE %s
                         OR lower(keyword) LIKE %s
@@ -1038,14 +1018,47 @@ def find_latest_event_by_keyword(chat_id: int, keyword: str) -> Optional[Dict[st
         conn.close()
 
 
-def notification_job_id(notification_id: int) -> str:
-    return f"notify_{notification_id}"
+def build_display_code(event_time: datetime, daily_index: int) -> str:
+    return f"{event_time.strftime('%m%d')}-{daily_index}"
 
 
-def build_notification_text(label: str, event_time: datetime, message: str, event_id: int) -> str:
-    if label == "- 1小時前":
-        return f"⏰ 提醒通知\n還有1小時：{event_time.strftime('%Y-%m-%d %H:%M')}｜{message}"
-    return f"⏰ 提醒通知\n現在時間到：{event_time.strftime('%Y-%m-%d %H:%M')}｜{message}"
+def build_display_mapping(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        event_time = parse_db_datetime(row["event_time"])
+        date_key = event_time.strftime("%Y-%m-%d")
+        row_copy = dict(row)
+        row_copy["_event_time_obj"] = event_time
+        grouped[date_key].append(row_copy)
+
+    display_rows: List[Dict[str, Any]] = []
+    mapping: Dict[str, int] = {}
+
+    for date_key in sorted(grouped.keys()):
+        day_rows = sorted(grouped[date_key], key=lambda x: (x["_event_time_obj"], int(x["id"])))
+        for idx, row in enumerate(day_rows, start=1):
+            display_code = build_display_code(row["_event_time_obj"], idx)
+            row["display_code"] = display_code
+            mapping[display_code] = int(row["id"])
+            display_rows.append(row)
+
+    return display_rows, mapping
+
+
+def resolve_event_id_from_cancel_token(chat_id: int, token: str) -> Optional[int]:
+    rows = get_user_pending_events(chat_id)
+    display_rows, mapping = build_display_mapping(rows)
+
+    if token in mapping:
+        return mapping[token]
+
+    if token.isdigit():
+        db_event_id = int(token)
+        for row in display_rows:
+            if int(row["id"]) == db_event_id:
+                return db_event_id
+
+    return None
 
 
 def schedule_one_notification(
@@ -1108,7 +1121,6 @@ def remove_all_scheduled_jobs_for_chat(chat_id: int) -> None:
                 FROM reminder_notifications rn
                 JOIN reminder_events re ON rn.event_id = re.id
                 WHERE re.chat_id = %s
-                  AND re.canceled = 0
                   AND rn.sent = 0
                 """,
                 (chat_id,)
@@ -1245,7 +1257,9 @@ def handle_help(chat_id: int) -> None:
         "明天早上9點開會\n"
         "明天下午2點買東西\n"
         "30分鐘後提醒我喝水\n\n"
-        "全部取消：\n"
+        "事件代碼格式會依日期每日重新編號，例如：0329-1、0329-2、0330-1\n"
+        "取消範例：\n"
+        "/cancel 0329-1\n"
         "取消所有提醒\n"
         "/cancel_all"
     )
@@ -1267,32 +1281,50 @@ def handle_list(chat_id: int) -> None:
         send_message(chat_id, "目前沒有未取消事件提醒。")
         return
 
+    display_rows, _ = build_display_mapping(rows)
+
     lines = ["📌 目前所有未取消提醒", ""]
-    for row in rows[:50]:
-        event_time = parse_db_datetime(row["event_time"])
-        lines.append(f"事件代碼：{row['id']}\n{event_time.strftime('%Y-%m-%d %H:%M')}｜{row['message']}")
+    current_date_label = None
+
+    for row in display_rows[:50]:
+        event_time = row["_event_time_obj"]
+        date_label = event_time.strftime("%Y-%m-%d")
+        if date_label != current_date_label:
+            if current_date_label is not None:
+                lines.append("")
+            lines.append(f"📅 {date_label}")
+            current_date_label = date_label
+
+        lines.append(f"事件代碼：{row['display_code']}")
+        lines.append(f"{event_time.strftime('%Y-%m-%d %H:%M')}｜{row['message']}")
         lines.append("")
+
     send_message(chat_id, "\n".join(lines).strip())
 
 
 def handle_cancel(chat_id: int, text: str) -> None:
-    m = re.match(r"^/cancel\s+(\d+)\s*$", text.strip())
+    m = re.match(r"^/cancel\s+([0-9]{4}-\d+|\d+)\s*$", text.strip())
     if not m:
-        send_message(chat_id, "用法：/cancel 事件代碼")
+        send_message(chat_id, "用法：/cancel 事件代碼\n例如：/cancel 0329-1")
         return
 
-    event_id = int(m.group(1))
+    token = m.group(1)
+    event_id = resolve_event_id_from_cancel_token(chat_id, token)
+    if event_id is None:
+        send_message(chat_id, f"找不到可取消的事件代碼 {token}")
+        return
+
     remove_scheduled_jobs_for_event(event_id)
-    ok = cancel_event_by_id(event_id, chat_id)
+    ok = delete_event_by_id(event_id, chat_id)
     if not ok:
-        send_message(chat_id, f"找不到可取消的事件代碼 #{event_id}")
+        send_message(chat_id, f"找不到可取消的事件代碼 {token}")
         return
     send_message(chat_id, "✅ 已取消提醒")
 
 
 def handle_cancel_all(chat_id: int) -> None:
     remove_all_scheduled_jobs_for_chat(chat_id)
-    canceled_count = cancel_all_events(chat_id)
+    canceled_count = delete_all_events(chat_id)
     if canceled_count <= 0:
         send_message(chat_id, "目前沒有可取消的提醒。")
         return
@@ -1323,7 +1355,7 @@ def handle_cancel_by_keyword(chat_id: int, text: str) -> bool:
     event_time = parse_db_datetime(row["event_time"])
 
     remove_scheduled_jobs_for_event(event_id)
-    ok = cancel_event_by_id(event_id, chat_id)
+    ok = delete_event_by_id(event_id, chat_id)
     if not ok:
         send_message(chat_id, "取消失敗，請稍後再試。")
         return True
@@ -1361,7 +1393,7 @@ def try_handle_multiple_event_reminders(chat_id: int, text: str) -> bool:
         if duplicate:
             old_event_id = int(duplicate["id"])
             remove_scheduled_jobs_for_event(old_event_id)
-            if cancel_event_by_id(old_event_id, chat_id):
+            if delete_event_by_id(old_event_id, chat_id):
                 replaced = True
 
         result = save_event_with_notifications(chat_id, event_time, message)
@@ -1405,7 +1437,7 @@ def try_handle_event_reminder(chat_id: int, text: str) -> bool:
     if duplicate:
         old_event_id = int(duplicate["id"])
         remove_scheduled_jobs_for_event(old_event_id)
-        if cancel_event_by_id(old_event_id, chat_id):
+        if delete_event_by_id(old_event_id, chat_id):
             replaced = True
 
     result = save_event_with_notifications(chat_id, event_time, message)
