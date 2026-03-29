@@ -71,7 +71,33 @@ WEATHER_CITY_ALIASES = {
     "連江縣": ["連江縣", "連江", "馬祖", "matsu", "lienchiang", "lienchiang county"],
 }
 
+WEATHER_CITY_COORDS = {
+    "臺北市": (25.0375, 121.5637),
+    "新北市": (25.0129, 121.4657),
+    "桃園市": (24.9937, 121.3010),
+    "臺中市": (24.1477, 120.6736),
+    "臺南市": (22.9999, 120.2269),
+    "高雄市": (22.6273, 120.3014),
+    "基隆市": (25.1276, 121.7392),
+    "新竹市": (24.8138, 120.9675),
+    "嘉義市": (23.4801, 120.4491),
+    "新竹縣": (24.8387, 121.0177),
+    "苗栗縣": (24.5602, 120.8214),
+    "彰化縣": (24.0800, 120.5389),
+    "南投縣": (23.9609, 120.9719),
+    "雲林縣": (23.7092, 120.4313),
+    "嘉義縣": (23.4518, 120.2555),
+    "屏東縣": (22.5519, 120.5488),
+    "宜蘭縣": (24.7021, 121.7378),
+    "花蓮縣": (23.9872, 121.6015),
+    "臺東縣": (22.7583, 121.1444),
+    "澎湖縣": (23.5710, 119.5797),
+    "金門縣": (24.4368, 118.3186),
+    "連江縣": (26.1602, 119.9517),
+}
+
 WEATHER_QUERY_TOKENS = ("天氣", "weather", "forecast", "氣溫", "溫度")
+WEATHER_WEEKDAY_MAP = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6, "七": 6}
 
 if not BOT_TOKEN:
     raise RuntimeError("Missing BOT_TOKEN in environment variables.")
@@ -446,9 +472,12 @@ def parse_news_command(text: str) -> Dict[str, Any]:
     return {"category": category, "limit": limit}
 
 
+
+
 def normalize_weather_text(text: str) -> str:
     text = (text or "").strip().lower()
     text = text.replace("　", " ")
+    text = text.replace("臺", "台")
     text = re.sub(r"\s+", "", text)
     return text
 
@@ -490,26 +519,372 @@ def is_weather_query(text: str) -> bool:
 
 def extract_weather_city(text: str) -> str:
     raw = (text or "").strip()
+    return resolve_weather_city(raw) or DEFAULT_WEATHER_CITY
 
-    if raw.startswith("/weather"):
-        arg = raw[len("/weather"):].strip()
-        if not arg:
-            return DEFAULT_WEATHER_CITY
-        return resolve_weather_city(arg) or arg
 
-    normalized = normalize_weather_text(raw)
-    if normalized in ("weather", "天氣"):
-        return DEFAULT_WEATHER_CITY
+def start_of_week(date_obj) -> datetime.date:
+    return date_obj - timedelta(days=date_obj.weekday())
 
-    candidate = raw
-    for token in ("天氣", "weather", "forecast", "氣溫", "溫度"):
-        candidate = re.sub(token, "", candidate, flags=re.IGNORECASE)
-    candidate = candidate.strip()
 
-    if not candidate:
-        return DEFAULT_WEATHER_CITY
+def weather_max_supported_date(today) -> datetime.date:
+    return start_of_week(today) + timedelta(days=20)
 
-    return resolve_weather_city(candidate) or resolve_weather_city(raw) or candidate
+
+def format_weekday(date_obj) -> str:
+    names = "一二三四五六日"
+    return names[date_obj.weekday()]
+
+
+def normalize_weather_query_for_parsing(text: str) -> str:
+    normalized = (text or "").strip()
+    normalized = normalized.replace("　", " ")
+    normalized = normalized.replace("臺", "台")
+    normalized = normalized.replace("禮拜", "週")
+    normalized = normalized.replace("星期", "週")
+    normalized = re.sub(r"\s+", "", normalized)
+    return normalized
+
+
+def parse_md_date_token(token: str, today) -> Optional[datetime.date]:
+    if not token:
+        return None
+
+    token = token.strip()
+    m = re.fullmatch(r"(\d{1,2})/(\d{1,2})", token)
+    if not m:
+        m = re.fullmatch(r"(\d{1,2})月(\d{1,2})日?", token)
+    if not m:
+        return None
+
+    month = int(m.group(1))
+    day = int(m.group(2))
+
+    for year in (today.year, today.year + 1):
+        try:
+            candidate = datetime(year, month, day).date()
+        except ValueError:
+            return None
+        if candidate >= today:
+            return candidate
+
+    return None
+
+
+def parse_relative_date_token(token: str, today) -> Optional[datetime.date]:
+    token = token.strip()
+    if token in ("今天", "今日", "現在"):
+        return today
+    if token in ("明天", "明日"):
+        return today + timedelta(days=1)
+    if token in ("後天",):
+        return today + timedelta(days=2)
+
+    m = re.fullmatch(r"(\d+)天後", token)
+    if m:
+        return today + timedelta(days=int(m.group(1)))
+
+    return None
+
+
+def parse_weekday_token(token: str, today) -> Optional[datetime.date]:
+    token = token.strip()
+    if not token:
+        return None
+
+    weekend_match = re.fullmatch(r"(這|这|本|今|下下|下|隔)?週末", token)
+    if weekend_match:
+        prefix = weekend_match.group(1) or ""
+        week_offset = 0
+        if prefix == "下":
+            week_offset = 1
+        elif prefix in ("下下", "隔"):
+            week_offset = 2
+        return start_of_week(today) + timedelta(days=5 + 7 * week_offset)
+
+    weekday_match = re.fullmatch(r"(這|这|本|今|下下|下|隔)?週([一二三四五六日天七])", token)
+    if not weekday_match:
+        return None
+
+    prefix = weekday_match.group(1) or ""
+    weekday = WEATHER_WEEKDAY_MAP[weekday_match.group(2)]
+
+    if prefix in ("這", "这", "本", "今"):
+        week_offset = 0
+    elif prefix == "下":
+        week_offset = 1
+    elif prefix in ("下下", "隔"):
+        week_offset = 2
+    else:
+        this_week_candidate = start_of_week(today) + timedelta(days=weekday)
+        if this_week_candidate >= today:
+            return this_week_candidate
+        return this_week_candidate + timedelta(days=7)
+
+    return start_of_week(today) + timedelta(days=weekday + 7 * week_offset)
+
+
+def parse_date_token(token: str, today) -> Optional[datetime.date]:
+    token = token.strip()
+    if not token:
+        return None
+
+    return (
+        parse_relative_date_token(token, today)
+        or parse_md_date_token(token, today)
+        or parse_weekday_token(token, today)
+    )
+
+
+def extract_date_fragment(text: str) -> str:
+    normalized = normalize_weather_query_for_parsing(text)
+    city = resolve_weather_city(normalized)
+    if city:
+        aliases = sorted(
+            {normalize_weather_text(alias) for alias in WEATHER_CITY_ALIASES.get(city, [])},
+            key=len,
+            reverse=True,
+        )
+        for alias in aliases:
+            if alias:
+                normalized = normalized.replace(alias, "")
+
+    for token in ("/weather", "weather", "forecast", "天氣", "氣溫", "溫度", "查詢", "預報"):
+        normalized = normalized.replace(token, "")
+    return normalized.strip()
+
+
+def parse_weather_date_range(text: str) -> Optional[Tuple[datetime.date, datetime.date, str]]:
+    today = datetime.now(TZINFO).date()
+    fragment = extract_date_fragment(text)
+
+    if not fragment:
+        return None
+
+    if fragment in ("一周", "一週", "整周", "整週", "本周", "本週", "這周", "這週"):
+        end = min(today + timedelta(days=6), weather_max_supported_date(today))
+        return today, end, "一週"
+
+    m = re.fullmatch(r"(這|这|本|今|下下|下|隔)?週六日", fragment)
+    if m:
+        prefix = m.group(1) or ""
+        if prefix in ("這", "这", "本", "今"):
+            week_offset = 0
+            label = "這週六日"
+        elif prefix == "下":
+            week_offset = 1
+            label = "下週六日"
+        elif prefix in ("下下", "隔"):
+            week_offset = 2
+            label = "隔週六日"
+        else:
+            week_offset = 0
+            label = "這週六日"
+        start = start_of_week(today) + timedelta(days=5 + 7 * week_offset)
+        end = start + timedelta(days=1)
+        return start, end, label
+
+    m = re.fullmatch(r"(這|这|本|今|下下|下|隔)?週末", fragment)
+    if m:
+        prefix = m.group(1) or ""
+        if prefix in ("這", "这", "本", "今"):
+            week_offset = 0
+            label = "這週末"
+        elif prefix == "下":
+            week_offset = 1
+            label = "下週末"
+        elif prefix in ("下下", "隔"):
+            week_offset = 2
+            label = "隔週末"
+        else:
+            week_offset = 0
+            label = "這週末"
+        start = start_of_week(today) + timedelta(days=5 + 7 * week_offset)
+        end = start + timedelta(days=1)
+        return start, end, label
+
+    range_match = re.fullmatch(r"(.+?)(?:~|－|-|到|至)(.+)", fragment)
+    if range_match:
+        left_token = range_match.group(1).strip()
+        right_token = range_match.group(2).strip()
+        start = parse_date_token(left_token, today)
+        end = parse_date_token(right_token, today)
+        if start and end:
+            if end < start:
+                start, end = end, start
+            return start, end, f"{left_token}~{right_token}"
+
+    single = parse_date_token(fragment, today)
+    if single:
+        return single, single, fragment
+
+    return None
+
+
+def weather_query_limit_message(city: str, max_date) -> str:
+    return (
+        f"目前 {city} 的進階日期查詢最遠支援到 {max_date.strftime('%Y-%m-%d')}（週{format_weekday(max_date)}）。\n"
+        "可用範例：下週五天氣、下週六日天氣、3/30~4/5 天氣。"
+    )
+
+
+def weather_code_to_zh(code: Any) -> str:
+    try:
+        code = int(code)
+    except Exception:
+        return "未知"
+
+    mapping = {
+        0: "晴朗",
+        1: "大致晴朗",
+        2: "晴時多雲",
+        3: "多雲",
+        45: "有霧",
+        48: "霧淞",
+        51: "毛毛雨",
+        53: "短暫毛雨",
+        55: "較強毛雨",
+        56: "凍雨",
+        57: "強凍雨",
+        61: "小雨",
+        63: "雨",
+        65: "大雨",
+        66: "凍雨",
+        67: "強凍雨",
+        71: "小雪",
+        73: "降雪",
+        75: "大雪",
+        77: "雪粒",
+        80: "陣雨",
+        81: "短暫陣雨",
+        82: "強陣雨",
+        85: "陣雪",
+        86: "強陣雪",
+        95: "雷雨",
+        96: "雷雨伴冰雹",
+        99: "強雷雨伴冰雹",
+    }
+    return mapping.get(code, "未知")
+
+
+def fetch_weather_range(city: str, start_date, end_date) -> Optional[List[Dict[str, Any]]]:
+    coords = WEATHER_CITY_COORDS.get(city)
+    if not coords:
+        logger.warning("No coordinates configured for city: %s", city)
+        return None
+
+    today = datetime.now(TZINFO).date()
+    forecast_days = (end_date - today).days + 1
+    forecast_days = max(1, min(16, forecast_days))
+
+    url = "https://api.open-meteo.com/v1/forecast"
+    params = {
+        "latitude": coords[0],
+        "longitude": coords[1],
+        "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max",
+        "timezone": TIMEZONE,
+        "forecast_days": forecast_days,
+    }
+
+    try:
+        r = requests.get(url, params=params, timeout=HTTP_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+
+        daily = data.get("daily", {})
+        dates = daily.get("time", [])
+        weather_codes = daily.get("weather_code", [])
+        tmax = daily.get("temperature_2m_max", [])
+        tmin = daily.get("temperature_2m_min", [])
+        popmax = daily.get("precipitation_probability_max", [])
+
+        rows: List[Dict[str, Any]] = []
+        for idx, date_str in enumerate(dates):
+            day = datetime.fromisoformat(str(date_str)).date()
+            if day < start_date or day > end_date:
+                continue
+
+            rows.append(
+                {
+                    "date": day,
+                    "weather": weather_code_to_zh(weather_codes[idx] if idx < len(weather_codes) else None),
+                    "min_temp": tmin[idx] if idx < len(tmin) else None,
+                    "max_temp": tmax[idx] if idx < len(tmax) else None,
+                    "pop": popmax[idx] if idx < len(popmax) else None,
+                }
+            )
+
+        return rows
+    except Exception as e:
+        logger.exception("Weather range fetch failed: %s", e)
+        return None
+
+
+def build_weather_tip(pop: Any) -> str:
+    try:
+        pop_value = int(round(float(pop)))
+    except Exception:
+        return ""
+
+    if pop_value >= 70:
+        return "提醒：降雨機率高，建議一定要帶傘。"
+    if pop_value >= 40:
+        return "提醒：可能下雨，外出建議備傘。"
+    if pop_value >= 20:
+        return "提醒：有些降雨機會，行程可留意天氣變化。"
+    return "提醒：降雨機率不高。"
+
+
+def format_weather_range_message(city: str, forecasts: Optional[List[Dict[str, Any]]], label: str = "") -> str:
+    if not forecasts:
+        return "天氣資料取得失敗，請稍後再試。"
+
+    if len(forecasts) == 1:
+        item = forecasts[0]
+        tip = build_weather_tip(item.get("pop"))
+        lines = [
+            f"🌤️ {city} {item['date'].strftime('%Y-%m-%d')}（週{format_weekday(item['date'])}）天氣預報",
+            f"天氣：{item.get('weather', '未知')}",
+            f"溫度：{item.get('min_temp', '--')} ~ {item.get('max_temp', '--')}°C",
+            f"降雨機率：{item.get('pop', '--')}%",
+        ]
+        if tip:
+            lines.append(tip)
+        return "\n".join(lines)
+
+    lines = [f"🌤️ {city} {label or '區間'}天氣預報", ""]
+    for item in forecasts:
+        lines.append(
+            f"{item['date'].strftime('%m/%d')}（週{format_weekday(item['date'])}）"
+            f"{item.get('weather', '未知')} "
+            f"{item.get('min_temp', '--')}~{item.get('max_temp', '--')}°C "
+            f"降雨{item.get('pop', '--')}%"
+        )
+    return "\n".join(lines).strip()
+
+
+def handle_weather(chat_id: int, text: str = "") -> None:
+    register_chat_id(chat_id)
+    city = extract_weather_city(text)
+    parsed_range = parse_weather_date_range(text)
+
+    if not parsed_range:
+        send_message(chat_id, format_weather_message(fetch_weather(city)))
+        return
+
+    start_date, end_date, label = parsed_range
+    today = datetime.now(TZINFO).date()
+    max_date = weather_max_supported_date(today)
+
+    if start_date < today:
+        send_message(chat_id, "目前僅支援今天之後的天氣預報。")
+        return
+
+    if end_date > max_date:
+        send_message(chat_id, weather_query_limit_message(city, max_date))
+        return
+
+    forecasts = fetch_weather_range(city, start_date, end_date)
+    send_message(chat_id, format_weather_range_message(city, forecasts, label))
 
 
 def fetch_weather(city: str = DEFAULT_WEATHER_CITY) -> Optional[Dict[str, Any]]:
@@ -595,13 +970,6 @@ def format_weather_message(weather: Optional[Dict[str, Any]]) -> str:
     if tip:
         lines.append(tip)
     return "\n".join(lines)
-
-
-def handle_weather(chat_id: int, text: str = "") -> None:
-    register_chat_id(chat_id)
-    city = extract_weather_city(text)
-    send_message(chat_id, format_weather_message(fetch_weather(city)))
-
 
 def send_daily_weather() -> None:
     logger.info("Running scheduled daily weather push...")
@@ -1465,10 +1833,10 @@ def handle_help(chat_id: int) -> None:
         "/news business\n"
         "/weather\n"
         "/weather 臺北市\n"
-        "桃園市天氣\n"
-        "桃園 天氣\n"
-        "taoyuan天氣\n"
-
+        "桃園天氣\n"
+        "下週五天氣\n"
+        "桃園下週六日天氣\n"
+        "3/30~4/5 天氣\n"
         "/list\n"
         "/cancel 事件代碼\n"
         "/cancel_all\n\n"
@@ -1705,7 +2073,9 @@ def handle_unknown(chat_id: int) -> None:
         "weather\n"
         "天氣\n"
         "桃園天氣\n"
-        "taoyuan weather\n\n"
+        "下週五天氣\n"
+        "桃園下週六日天氣\n"
+        "3/30~4/5 天氣\n\n"
         "也可以直接輸入提醒，例如：\n"
         "晚上7點半打球\n"
         "今天早上七點吃早餐\n"
@@ -1864,7 +2234,7 @@ def telegram_webhook():
             handle_help(chat_id)
         elif text.startswith("/news") or lowered in ("news", "new"):
             handle_news(chat_id, text if text.startswith("/news") else "/news")
-        elif text.startswith("/weather") or is_weather_query(text):
+        elif is_weather_query(text):
             handle_weather(chat_id, text)
         elif text.startswith("/list"):
             handle_list(chat_id)
