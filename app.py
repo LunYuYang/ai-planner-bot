@@ -45,6 +45,34 @@ DEFAULT_WEATHER_CITY = os.getenv("DEFAULT_WEATHER_CITY", "臺南市").strip()
 WEATHER_PUSH_TIME = os.getenv("WEATHER_PUSH_TIME", "").strip()
 DAILY_CLEANUP_TIME = os.getenv("DAILY_CLEANUP_TIME", "03:30").strip()
 
+
+WEATHER_CITY_ALIASES = {
+    "臺北市": ["臺北市", "台北市", "臺北", "台北", "taipei", "taipei city"],
+    "新北市": ["新北市", "新北", "newtaipei", "new taipei", "newtaipeicity", "new taipei city"],
+    "桃園市": ["桃園市", "桃園", "taoyuan", "taoyuan city"],
+    "臺中市": ["臺中市", "台中市", "臺中", "台中", "taichung", "taichung city"],
+    "臺南市": ["臺南市", "台南市", "臺南", "台南", "tainan", "tainan city"],
+    "高雄市": ["高雄市", "高雄", "kaohsiung", "kaohsiung city"],
+    "基隆市": ["基隆市", "基隆", "keelung", "keelung city"],
+    "新竹市": ["新竹市", "新竹", "hsinchu", "hsinchu city"],
+    "嘉義市": ["嘉義市", "嘉義", "chiayi", "chiayi city"],
+    "新竹縣": ["新竹縣", "hsinchu county"],
+    "苗栗縣": ["苗栗縣", "苗栗", "miaoli", "miaoli county"],
+    "彰化縣": ["彰化縣", "彰化", "changhua", "changhua county"],
+    "南投縣": ["南投縣", "南投", "nantou", "nantou county"],
+    "雲林縣": ["雲林縣", "雲林", "yunlin", "yunlin county"],
+    "嘉義縣": ["嘉義縣", "chiayi county"],
+    "屏東縣": ["屏東縣", "屏東", "pingtung", "pingtung county"],
+    "宜蘭縣": ["宜蘭縣", "宜蘭", "yilan", "yilan county"],
+    "花蓮縣": ["花蓮縣", "花蓮", "hualien", "hualien county"],
+    "臺東縣": ["臺東縣", "台東縣", "臺東", "台東", "taitung", "taitung county"],
+    "澎湖縣": ["澎湖縣", "澎湖", "penghu", "penghu county"],
+    "金門縣": ["金門縣", "金門", "kinmen", "kinmen county"],
+    "連江縣": ["連江縣", "連江", "馬祖", "matsu", "lienchiang", "lienchiang county"],
+}
+
+WEATHER_QUERY_TOKENS = ("天氣", "weather", "forecast", "氣溫", "溫度")
+
 if not BOT_TOKEN:
     raise RuntimeError("Missing BOT_TOKEN in environment variables.")
 
@@ -418,6 +446,72 @@ def parse_news_command(text: str) -> Dict[str, Any]:
     return {"category": category, "limit": limit}
 
 
+def normalize_weather_text(text: str) -> str:
+    text = (text or "").strip().lower()
+    text = text.replace("　", " ")
+    text = re.sub(r"\s+", "", text)
+    return text
+
+
+def resolve_weather_city(text: str) -> Optional[str]:
+    normalized = normalize_weather_text(text)
+    if not normalized:
+        return None
+
+    for canonical, aliases in WEATHER_CITY_ALIASES.items():
+        normalized_aliases = {normalize_weather_text(alias) for alias in aliases}
+        if normalized in normalized_aliases:
+            return canonical
+
+    for canonical, aliases in WEATHER_CITY_ALIASES.items():
+        normalized_aliases = sorted(
+            {normalize_weather_text(alias) for alias in aliases},
+            key=len,
+            reverse=True,
+        )
+        for alias in normalized_aliases:
+            if alias and alias in normalized:
+                return canonical
+
+    return None
+
+
+def is_weather_query(text: str) -> bool:
+    raw = (text or "").strip()
+    if raw.startswith("/weather"):
+        return True
+
+    normalized = normalize_weather_text(raw)
+    if normalized in ("weather", "天氣"):
+        return True
+
+    return any(token in normalized for token in WEATHER_QUERY_TOKENS)
+
+
+def extract_weather_city(text: str) -> str:
+    raw = (text or "").strip()
+
+    if raw.startswith("/weather"):
+        arg = raw[len("/weather"):].strip()
+        if not arg:
+            return DEFAULT_WEATHER_CITY
+        return resolve_weather_city(arg) or arg
+
+    normalized = normalize_weather_text(raw)
+    if normalized in ("weather", "天氣"):
+        return DEFAULT_WEATHER_CITY
+
+    candidate = raw
+    for token in ("天氣", "weather", "forecast", "氣溫", "溫度"):
+        candidate = re.sub(token, "", candidate, flags=re.IGNORECASE)
+    candidate = candidate.strip()
+
+    if not candidate:
+        return DEFAULT_WEATHER_CITY
+
+    return resolve_weather_city(candidate) or resolve_weather_city(raw) or candidate
+
+
 def fetch_weather(city: str = DEFAULT_WEATHER_CITY) -> Optional[Dict[str, Any]]:
     if not CWA_API_KEY:
         logger.warning("CWA_API_KEY not set.")
@@ -505,10 +599,7 @@ def format_weather_message(weather: Optional[Dict[str, Any]]) -> str:
 
 def handle_weather(chat_id: int, text: str = "") -> None:
     register_chat_id(chat_id)
-    city = DEFAULT_WEATHER_CITY
-    parts = text.strip().split(maxsplit=1)
-    if len(parts) >= 2 and parts[1].strip():
-        city = parts[1].strip()
+    city = extract_weather_city(text)
     send_message(chat_id, format_weather_message(fetch_weather(city)))
 
 
@@ -1374,6 +1465,10 @@ def handle_help(chat_id: int) -> None:
         "/news business\n"
         "/weather\n"
         "/weather 臺北市\n"
+        "桃園市天氣\n"
+        "桃園 天氣\n"
+        "taoyuan天氣\n"
+
         "/list\n"
         "/cancel 事件代碼\n"
         "/cancel_all\n\n"
@@ -1608,7 +1703,9 @@ def handle_unknown(chat_id: int) -> None:
         "news\n"
         "new\n"
         "weather\n"
-        "天氣\n\n"
+        "天氣\n"
+        "桃園天氣\n"
+        "taoyuan weather\n\n"
         "也可以直接輸入提醒，例如：\n"
         "晚上7點半打球\n"
         "今天早上七點吃早餐\n"
@@ -1767,8 +1864,8 @@ def telegram_webhook():
             handle_help(chat_id)
         elif text.startswith("/news") or lowered in ("news", "new"):
             handle_news(chat_id, text if text.startswith("/news") else "/news")
-        elif text.startswith("/weather") or lowered in ("weather", "天氣"):
-            handle_weather(chat_id, text if text.startswith("/weather") else "/weather")
+        elif text.startswith("/weather") or is_weather_query(text):
+            handle_weather(chat_id, text)
         elif text.startswith("/list"):
             handle_list(chat_id)
         elif text.startswith("/cancel_all"):
