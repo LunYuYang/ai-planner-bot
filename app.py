@@ -7,6 +7,7 @@ from pathlib import Path
 from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional, Tuple
+from urllib.parse import quote
 
 import requests
 import feedparser
@@ -548,9 +549,11 @@ FOOD_TRIGGER_PATTERNS = [kw for kws in FOOD_KEYWORDS.values() for kw in kws] + [
     "nearby lunch", "nearby dinner", "nearby late night"
 ]
 
-DEFAULT_FOOD_RADIUS_METERS = 8000
-DEFAULT_FOOD_LIMIT = 6
+DEFAULT_FOOD_RADIUS_METERS = 3000
+DEFAULT_FOOD_LIMIT = 5
 DEFAULT_FOOD_MIN_RATING = 4.5
+DEFAULT_FOOD_MAX_RATING = 4.8
+DEFAULT_FOOD_MIN_REVIEWS = 50
 
 
 def load_pending_food_requests() -> Dict[str, Any]:
@@ -618,18 +621,19 @@ def parse_distance_meters(text: str) -> int:
 def parse_budget_twd(text: str) -> Dict[str, Optional[int]]:
     raw = (text or "").replace(",", "")
 
-    m = re.search(r"(\d{2,5})\s*(?:元|塊|ntd|nt\$|twd)?\s*[~～\-到至]\s*(\d{2,5})\s*(?:元|塊|ntd|nt\$|twd)?", raw, re.IGNORECASE)
+    # 支援：100-200、100~200、100到200、100至200、100 - 200、100-200元
+    m = re.search(r"(\d{1,5})\s*(?:元)?\s*[~～\-－—到至]\s*(\d{1,5})\s*(?:元)?", raw, re.IGNORECASE)
     if m:
         low, high = int(m.group(1)), int(m.group(2))
         if low > high:
             low, high = high, low
         return {"min_twd": low, "max_twd": high}
 
-    m = re.search(r"(\d{2,5})\s*(?:元|塊|ntd|nt\$|twd)?\s*(以下|以內|內|under)", raw, re.IGNORECASE)
+    m = re.search(r"(\d{1,5})\s*(?:元)?\s*(以下|以內|內|under)", raw, re.IGNORECASE)
     if m:
         return {"min_twd": None, "max_twd": int(m.group(1))}
 
-    m = re.search(r"(\d{2,5})\s*(?:元|塊|ntd|nt\$|twd)?\s*(以上|起|up)", raw, re.IGNORECASE)
+    m = re.search(r"(\d{1,5})\s*(?:元)?\s*(以上|起|up)", raw, re.IGNORECASE)
     if m:
         return {"min_twd": int(m.group(1)), "max_twd": None}
 
@@ -657,40 +661,6 @@ def parse_price_levels(text: str) -> Dict[str, Optional[int]]:
         "maxprice": twd_to_google_price_level(budget.get("max_twd"), is_max=True),
         "budget": budget,
     }
-
-def estimate_price_level_twd_range(level: Any) -> Optional[Tuple[int, Optional[int]]]:
-    try:
-        level = int(level)
-    except Exception:
-        return None
-
-    mapping = {
-        0: (0, 150),
-        1: (151, 400),
-        2: (401, 900),
-        3: (901, 1800),
-        4: (1801, None),
-    }
-    return mapping.get(level)
-
-
-def budget_matches_price_level(budget: Dict[str, Optional[int]], price_level: Any) -> bool:
-    min_twd = budget.get("min_twd")
-    max_twd = budget.get("max_twd")
-
-    if min_twd is None and max_twd is None:
-        return True
-
-    estimated = estimate_price_level_twd_range(price_level)
-    if estimated is None:
-        return False
-
-    level_min, level_max = estimated
-    req_min = 0 if min_twd is None else min_twd
-    req_max = float("inf") if max_twd is None else max_twd
-    cand_max = float("inf") if level_max is None else level_max
-
-    return not (req_max < level_min or req_min > cand_max)
 
 
 def detect_explicit_location(text: str) -> Tuple[Optional[str], Optional[Tuple[float, float]]]:
@@ -755,11 +725,14 @@ def food_mode_title(mode: str) -> str:
     }.get(mode, "美食")
 
 
-def google_maps_place_link(place_id: str) -> str:
-    return f"https://www.google.com/maps/place/?q=place_id:{place_id}"
+
+def google_maps_place_link(place_id: str, name: str = "") -> str:
+    if name:
+        return f"https://www.google.com/maps/search/?api=1&query={quote(name)}&query_place_id={place_id}"
+    return f"https://www.google.com/maps/search/?api=1&query=Google&query_place_id={place_id}"
 
 
-def search_nearby_places(lat: float, lng: float, mode: str, radius_meters: int, minprice: Optional[int], maxprice: Optional[int], budget: Optional[Dict[str, Optional[int]]] = None) -> List[Dict[str, Any]]:
+def search_nearby_places(lat: float, lng: float, mode: str, radius_meters: int, minprice: Optional[int], maxprice: Optional[int]) -> List[Dict[str, Any]]:
     if not GOOGLE_MAPS_API_KEY:
         return []
 
@@ -789,13 +762,17 @@ def search_nearby_places(lat: float, lng: float, mode: str, radius_meters: int, 
             for item in payload.get("results", []):
                 place_id = item.get("place_id")
                 rating = float(item.get("rating") or 0)
-                if not place_id or place_id in seen or rating < DEFAULT_FOOD_MIN_RATING:
+                user_ratings_total = int(item.get("user_ratings_total") or 0)
+                if (
+                    not place_id
+                    or place_id in seen
+                    or rating < DEFAULT_FOOD_MIN_RATING
+                    or rating > DEFAULT_FOOD_MAX_RATING
+                    or user_ratings_total < DEFAULT_FOOD_MIN_REVIEWS
+                ):
                     continue
 
                 price_level = item.get("price_level")
-                if budget and not budget_matches_price_level(budget, price_level):
-                    continue
-
                 name = item.get("name", "未知店家")
                 lowered = normalize_food_text(name)
                 is_fine = price_level is not None and int(price_level) >= 3 or any(x in lowered for x in ["fine", "omakase", "牛排", "鐵板燒", "法式", "無菜單"])
@@ -808,13 +785,17 @@ def search_nearby_places(lat: float, lng: float, mode: str, radius_meters: int, 
                 results.append({
                     "name": name,
                     "rating": rating,
-                    "user_ratings_total": int(item.get("user_ratings_total") or 0),
+                    "user_ratings_total": user_ratings_total,
                     "price_level": price_level,
                     "address": item.get("vicinity") or item.get("formatted_address") or "",
                     "place_id": place_id,
                     "types": item.get("types") or [],
-                    "maps_link": google_maps_place_link(place_id),
+                    "maps_link": google_maps_place_link(place_id, name),
                 })
+
+                if len(results) >= DEFAULT_FOOD_LIMIT:
+                    results.sort(key=lambda x: (x["rating"], x["user_ratings_total"]), reverse=True)
+                    return results
         except Exception as e:
             logger.exception("Nearby food search failed for keyword=%s: %s", keyword, e)
 
@@ -849,13 +830,13 @@ def format_food_results_message(mode: str, location_label: str, radius_meters: i
         return (
             f"🍽️ {location_label} {title}推薦\n"
             f"範圍：約 {radius_meters // 1000} 公里｜{format_budget_hint(budget)}\n\n"
-            "目前找不到符合條件（評分 4.5 以上）的店家，可以放寬價格或距離再試一次。"
+            f"目前找不到符合條件的店家。\n條件：評分 {DEFAULT_FOOD_MIN_RATING}~{DEFAULT_FOOD_MAX_RATING}、評論數 {DEFAULT_FOOD_MIN_REVIEWS}+。\n可以放寬價格或距離再試一次。"
         )
 
     lines = [
         f"🍽️ {location_label} {title}推薦",
         f"範圍：約 {radius_meters // 1000} 公里｜{format_budget_hint(budget)}",
-        "篩選：Google 評分 4.5 以上",
+        f"篩選：Google 評分 {DEFAULT_FOOD_MIN_RATING}~{DEFAULT_FOOD_MAX_RATING}｜評論數 {DEFAULT_FOOD_MIN_REVIEWS}+",
         "",
     ]
     for idx, item in enumerate(places, start=1):
@@ -878,7 +859,7 @@ def send_location_request_for_food(chat_id: int, query_info: Dict[str, Any]) -> 
         "text": (
             f"📍 這次要找 {title}。\n"
             f"目前沒有指定城市，我需要你的定位來查附近約 {km} 公里內的店家。\n"
-            f"{budget_hint}｜篩選 Google 評分 4.5 以上\n\n"
+            f"{budget_hint}｜篩選 Google 評分 4.5~4.8｜評論數 50+\n\n"
             "請按下方按鈕分享目前位置。"
         ),
         "reply_markup": {
@@ -905,7 +886,6 @@ def handle_food_location_message(chat_id: int, location: Dict[str, Any]) -> None
         radius_meters=int(pending.get("radius_meters", DEFAULT_FOOD_RADIUS_METERS)),
         minprice=pending.get("minprice"),
         maxprice=pending.get("maxprice"),
-        budget=pending.get("budget"),
     )
     clear_pending_food_request(chat_id)
     payload = {"remove_keyboard": True}
@@ -951,7 +931,6 @@ def handle_food(chat_id: int, text: str) -> None:
         radius_meters=query["radius_meters"],
         minprice=query["minprice"],
         maxprice=query["maxprice"],
-        budget=query["budget"],
     )
     send_message(
         chat_id,
