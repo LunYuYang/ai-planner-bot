@@ -601,6 +601,146 @@ def normalize_chinese_time_text(text: str) -> str:
     return normalized
 
 
+WEEKDAY_MAP = {
+    "一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6,
+}
+
+
+def extract_time_and_message(text: str) -> Optional[Tuple[Optional[str], int, int, str]]:
+    m = re.match(
+        r"^\s*(早上|上午|中午|下午|晚上)?\s*(\d{1,2})(?:(?:\s*[:：]\s*(\d{1,2}))|(?:\s*點\s*(半|(\d{1,2}))?))?\s*(?:分)?\s*(提醒我)?\s*(.+?)\s*$",
+        text,
+    )
+    if not m:
+        return None
+
+    period, hour_str, minute_str_colon, half_flag, minute_str_dot, _, msg = m.groups()
+    hour = int(hour_str)
+
+    if minute_str_colon is not None:
+        minute = int(minute_str_colon)
+    elif half_flag == "半":
+        minute = 30
+    elif minute_str_dot is not None:
+        minute = int(minute_str_dot)
+    else:
+        minute = 0
+
+    if minute < 0 or minute > 59:
+        return None
+
+    if period in ("下午", "晚上") and hour < 12:
+        hour += 12
+    elif period == "中午":
+        if hour != 12 and hour < 11:
+            hour += 12
+    elif period in ("早上", "上午") and hour == 12:
+        hour = 0
+
+    if hour < 0 or hour > 23:
+        return None
+
+    return period, hour, minute, msg.strip()
+
+
+def end_of_date_prefix(text: str) -> Optional[int]:
+    for sep in (" ", "　"):
+        idx = text.find(sep)
+        if idx > 0:
+            return idx
+    return None
+
+
+def split_date_and_rest(raw: str) -> Tuple[Optional[str], str]:
+    raw = raw.strip()
+    prefixes = [
+        r"\d{4}[/-]\d{1,2}[/-]\d{1,2}",
+        r"\d{1,2}[/-]\d{1,2}",
+        r"今天",
+        r"明天",
+        r"後天",
+        r"大後天",
+        r"(\d+)天後",
+        r"(\d+)週後",
+        r"(\d+)周後",
+        r"(\d+)個星期後",
+        r"(\d+)個禮拜後",
+        r"下週[一二三四五六日天]",
+        r"下周[一二三四五六日天]",
+        r"下禮拜[一二三四五六日天]",
+        r"這週[一二三四五六日天]",
+        r"這周[一二三四五六日天]",
+        r"這禮拜[一二三四五六日天]",
+    ]
+
+    for pattern in prefixes:
+        m = re.match(rf"^\s*({pattern})", raw)
+        if m:
+            prefix = m.group(1)
+            rest = raw[m.end():].strip()
+            return prefix, rest
+
+    return None, raw
+
+
+def parse_date_token(token: str, now: datetime) -> Optional[datetime.date]:
+    token = token.strip()
+    if not token:
+        return now.date()
+
+    if token == "今天":
+        return now.date()
+    if token == "明天":
+        return (now + timedelta(days=1)).date()
+    if token == "後天":
+        return (now + timedelta(days=2)).date()
+    if token == "大後天":
+        return (now + timedelta(days=3)).date()
+
+    m = re.fullmatch(r"(\d+)天後", token)
+    if m:
+        return (now + timedelta(days=int(m.group(1)))).date()
+
+    m = re.fullmatch(r"(\d+)\s*(週|周|個星期|個禮拜)後", token)
+    if m:
+        return (now + timedelta(days=7 * int(m.group(1)))).date()
+
+    m = re.fullmatch(r"(下週|下周|下禮拜|這週|這周|這禮拜)([一二三四五六日天])", token)
+    if m:
+        prefix, weekday_ch = m.groups()
+        target_weekday = WEEKDAY_MAP[weekday_ch]
+        current_weekday = now.weekday()
+        delta = (target_weekday - current_weekday) % 7
+        if prefix in ("下週", "下周", "下禮拜"):
+            delta += 7 if delta == 0 else 7
+        return (now + timedelta(days=delta)).date()
+
+    m = re.fullmatch(r"(\d{4})[/-](\d{1,2})[/-](\d{1,2})", token)
+    if m:
+        year, month, day = map(int, m.groups())
+        try:
+            return datetime(year, month, day, tzinfo=TZINFO).date()
+        except ValueError:
+            return None
+
+    m = re.fullmatch(r"(\d{1,2})[/-](\d{1,2})", token)
+    if m:
+        month, day = map(int, m.groups())
+        year = now.year
+        try:
+            candidate = datetime(year, month, day, tzinfo=TZINFO)
+        except ValueError:
+            return None
+        if candidate.date() < now.date():
+            try:
+                candidate = datetime(year + 1, month, day, tzinfo=TZINFO)
+            except ValueError:
+                return None
+        return candidate.date()
+
+    return None
+
+
 def parse_relative_reminder(text: str) -> Optional[Dict[str, Any]]:
     raw = normalize_chinese_time_text(text.strip())
     now = datetime.now(TZINFO)
@@ -627,6 +767,24 @@ def parse_absolute_reminder(text: str) -> Optional[Dict[str, Any]]:
     raw = normalize_chinese_time_text(text.strip())
     now = datetime.now(TZINFO)
 
+    date_token, rest = split_date_and_rest(raw)
+
+    if date_token:
+        base_date = parse_date_token(date_token, now)
+        if not base_date:
+            return None
+        parsed = extract_time_and_message(rest)
+        if not parsed:
+            return None
+        _, hour, minute, msg = parsed
+        try:
+            dt = datetime(base_date.year, base_date.month, base_date.day, hour, minute, tzinfo=TZINFO)
+        except ValueError:
+            return None
+        if dt <= now:
+            return None
+        return {"event_time": dt, "message": msg.strip()}
+
     m = re.match(r"^\s*(\d{4}-\d{2}-\d{2})\s+(\d{1,2}):(\d{2})\s+(.+?)\s*$", raw)
     if m:
         date_str, hour_str, minute_str, msg = m.groups()
@@ -635,40 +793,12 @@ def parse_absolute_reminder(text: str) -> Optional[Dict[str, Any]]:
             return None
         return {"event_time": dt, "message": msg.strip()}
 
-    m = re.match(
-        r"^\s*(今天|明天|昨天)?\s*(早上|上午|中午|下午|晚上)?\s*(\d{1,2})(?:(?:\s*[:：]\s*(\d{1,2}))|(?:\s*點\s*(半|(\d{1,2}))?))?\s*(?:分)?\s*(提醒我)?\s*(.+?)\s*$",
-        raw
-    )
-    if not m:
+    parsed = extract_time_and_message(raw)
+    if not parsed:
         return None
 
-    day_word, period, hour_str, minute_str_colon, half_flag, minute_str_dot, _, msg = m.groups()
-
-    if day_word == "明天":
-        base_date = (now + timedelta(days=1)).date()
-    elif day_word == "昨天":
-        return None
-    else:
-        base_date = now.date()
-
-    hour = int(hour_str)
-
-    if minute_str_colon is not None:
-        minute = int(minute_str_colon)
-    elif half_flag == "半":
-        minute = 30
-    elif minute_str_dot is not None:
-        minute = int(minute_str_dot)
-    else:
-        minute = 0
-
-    if period in ("下午", "晚上") and hour < 12:
-        hour += 12
-    elif period == "中午":
-        if hour != 12 and hour < 11:
-            hour += 12
-    elif period in ("早上", "上午") and hour == 12:
-        hour = 0
+    _, hour, minute, msg = parsed
+    base_date = now.date()
 
     try:
         dt = datetime(base_date.year, base_date.month, base_date.day, hour, minute, tzinfo=TZINFO)
