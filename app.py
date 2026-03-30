@@ -120,6 +120,349 @@ scheduler = BackgroundScheduler(timezone=TZINFO)
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 
+AI_ROUTER_ENABLED = os.getenv("AI_ROUTER_ENABLED", "true").strip().lower() == "true"
+
+AI_ROUTER_SYSTEM_PROMPT = """
+你是一個 Telegram 個人助理機器人的意圖路由器。
+你的工作不是直接回答問題，而是把使用者輸入解析成固定 JSON。
+
+支援的 intent：
+- food
+- weather
+- news
+- reminder
+- unknown
+
+支援的 action：
+- search
+- create
+- cancel
+- list
+- summary
+- unknown
+
+請務必：
+1. 僅輸出 JSON
+2. 不要加 markdown code block
+3. 沒有把握時，intent 用 unknown
+4. reminder 的 time_text 保留使用者原話，不要自行改寫成你猜的時間
+5. food 若沒有明確地點 location 就填 null，requires_location=true
+6. weather 若沒提地點 location 可填 null
+7. news topic 可用：ai / tech / business / semiconductor / crypto / all
+8. food meal_type 可用：breakfast / lunch / dinner / late_night / snack / fine_dining / generic
+9. reply_style 可用：short / normal
+
+JSON schema:
+{
+  "intent": "food|weather|news|reminder|unknown",
+  "action": "search|create|cancel|list|summary|unknown",
+  "entities": {
+    "meal_type": null,
+    "price_min": null,
+    "price_max": null,
+    "radius_km": null,
+    "location": null,
+    "requires_location": null,
+    "date_text": null,
+    "topic": null,
+    "time_range": null,
+    "format": null,
+    "time_text": null,
+    "message": null,
+    "operation": null
+  },
+  "reply_style": "normal"
+}
+""".strip()
+
+AI_ROUTER_DEFAULT = {
+    "intent": "unknown",
+    "action": "unknown",
+    "entities": {
+        "meal_type": None,
+        "price_min": None,
+        "price_max": None,
+        "radius_km": None,
+        "location": None,
+        "requires_location": None,
+        "date_text": None,
+        "topic": None,
+        "time_range": None,
+        "format": None,
+        "time_text": None,
+        "message": None,
+        "operation": None,
+    },
+    "reply_style": "normal",
+}
+
+
+def ai_router_default() -> Dict[str, Any]:
+    return json.loads(json.dumps(AI_ROUTER_DEFAULT))
+
+
+def safe_json_loads(text: str) -> Optional[Dict[str, Any]]:
+    text = (text or "").strip()
+    if not text:
+        return None
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?", "", text).strip()
+        text = re.sub(r"```$", "", text).strip()
+    try:
+        obj = json.loads(text)
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
+
+
+def merge_ai_router_default(obj: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    merged = ai_router_default()
+    if not obj:
+        return merged
+
+    merged["intent"] = str(obj.get("intent") or merged["intent"])
+    merged["action"] = str(obj.get("action") or merged["action"])
+    merged["reply_style"] = str(obj.get("reply_style") or merged["reply_style"])
+
+    entities = obj.get("entities") or {}
+    if isinstance(entities, dict):
+        for key in merged["entities"].keys():
+            if key in entities:
+                merged["entities"][key] = entities[key]
+
+    return merged
+
+
+def heuristic_intent_router(text: str) -> Dict[str, Any]:
+    raw = (text or "").strip()
+    normalized = normalize_food_text(raw) if raw else ""
+
+    # news
+    if any(token in normalized for token in ["新聞", "news", "ai新聞", "科技新聞", "財經新聞", "商業新聞"]):
+        topic = "all"
+        lowered = raw.lower()
+        if "ai" in lowered or "人工智慧" in raw or "科技" in raw:
+            topic = "ai"
+        elif "財經" in raw or "商業" in raw or "business" in lowered or "finance" in lowered:
+            topic = "business"
+        elif "半導體" in raw:
+            topic = "semiconductor"
+        elif "加密" in raw or "幣圈" in raw or "crypto" in lowered:
+            topic = "crypto"
+        return merge_ai_router_default({
+            "intent": "news",
+            "action": "summary",
+            "entities": {"topic": topic, "time_range": "today", "format": "short"},
+        })
+
+    # reminder list/cancel
+    if "提醒" in raw:
+        if any(token in raw for token in ["有哪些提醒", "目前提醒", "查看提醒", "列出提醒", "提醒列表"]):
+            return merge_ai_router_default({
+                "intent": "reminder",
+                "action": "list",
+                "entities": {"operation": "list"},
+            })
+        if raw.startswith("取消") or "取消提醒" in raw:
+            msg = re.sub(r"^\s*取消\s*", "", raw).strip() or None
+            return merge_ai_router_default({
+                "intent": "reminder",
+                "action": "cancel",
+                "entities": {"operation": "cancel", "message": msg},
+            })
+        # 例如 提醒我20:00要離開學校 / 提醒我 明天晚上七點 打球
+        m = re.match(r"^\s*提醒我\s*(.+?)\s*要\s*(.+?)\s*$", raw)
+        if m:
+            return merge_ai_router_default({
+                "intent": "reminder",
+                "action": "create",
+                "entities": {"operation": "create", "time_text": m.group(1).strip(), "message": m.group(2).strip()},
+            })
+        m = re.match(r"^\s*提醒我\s*(.+?)\s+(.+?)\s*$", raw)
+        if m:
+            return merge_ai_router_default({
+                "intent": "reminder",
+                "action": "create",
+                "entities": {"operation": "create", "time_text": m.group(1).strip(), "message": m.group(2).strip()},
+            })
+
+    return ai_router_default()
+
+
+def parse_user_intent_with_gpt(text: str, memory: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    if not AI_ROUTER_ENABLED:
+        return ai_router_default()
+
+    heuristic = heuristic_intent_router(text)
+    if heuristic.get("intent") != "unknown":
+        return heuristic
+
+    if not client:
+        return ai_router_default()
+
+    memory_text = json.dumps(memory or {}, ensure_ascii=False)
+    user_prompt = (
+        f"使用者輸入：{text}\n"
+        f"上下文記憶：{memory_text}\n"
+        "請只輸出 JSON。"
+    )
+
+    try:
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": AI_ROUTER_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0,
+            max_tokens=300,
+            response_format={"type": "json_object"},
+        )
+        content = (resp.choices[0].message.content or "").strip()
+        parsed = safe_json_loads(content)
+        return merge_ai_router_default(parsed)
+    except Exception as e:
+        logger.exception("AI router parse failed: %s", e)
+        return ai_router_default()
+
+
+def build_food_text_from_entities(entities: Dict[str, Any]) -> str:
+    parts: List[str] = []
+    meal_map = {
+        "breakfast": "早餐",
+        "lunch": "午餐",
+        "dinner": "晚餐",
+        "late_night": "宵夜",
+        "snack": "小吃",
+        "fine_dining": "高級餐廳",
+        "generic": "美食",
+    }
+    meal_type = entities.get("meal_type")
+    parts.append(meal_map.get(meal_type, "美食"))
+
+    price_min = entities.get("price_min")
+    price_max = entities.get("price_max")
+    if price_min is not None and price_max is not None:
+        parts.append(f"{price_min}-{price_max}")
+    elif price_min is not None:
+        parts.append(f"{price_min}以上")
+    elif price_max is not None:
+        parts.append(f"{price_max}以下")
+
+    location = entities.get("location")
+    if location:
+        parts.insert(0, str(location))
+
+    radius_km = entities.get("radius_km")
+    if radius_km:
+        parts.append(f"{radius_km}公里")
+
+    return " ".join(str(x) for x in parts if x)
+
+
+def build_weather_text_from_entities(entities: Dict[str, Any]) -> str:
+    location = entities.get("location")
+    date_text = entities.get("date_text")
+    if location and date_text:
+        return f"{location}{date_text}天氣"
+    if location:
+        return f"{location}天氣"
+    if date_text:
+        return f"{date_text}天氣"
+    return "天氣"
+
+
+def build_news_command_from_entities(entities: Dict[str, Any]) -> str:
+    topic = str(entities.get("topic") or "all").lower()
+    topic_map = {
+        "ai": "tech",
+        "tech": "tech",
+        "business": "business",
+        "semiconductor": "tech",
+        "crypto": "business",
+        "all": "all",
+    }
+    mapped = topic_map.get(topic, "all")
+    return "/news" if mapped == "all" else f"/news {mapped}"
+
+
+def build_reminder_text_from_entities(entities: Dict[str, Any]) -> str:
+    operation = str(entities.get("operation") or "create").lower()
+    if operation == "list":
+        return "/list"
+    if operation == "cancel":
+        message = str(entities.get("message") or "").strip()
+        return f"取消 {message}" if message else "/cancel_all"
+
+    time_text = str(entities.get("time_text") or "").strip()
+    message = str(entities.get("message") or "").strip()
+    if time_text and message:
+        return f"{time_text} {message}"
+    return ""
+
+
+def route_message_with_ai(text: str, memory: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    parsed = parse_user_intent_with_gpt(text=text, memory=memory)
+    entities = parsed.get("entities") or {}
+    dispatch = {
+        "intent": parsed.get("intent", "unknown"),
+        "action": parsed.get("action", "unknown"),
+        "reply_style": parsed.get("reply_style", "normal"),
+        "entities": entities,
+        "forward_text": None,
+    }
+
+    intent = dispatch["intent"]
+    if intent == "food":
+        dispatch["forward_text"] = build_food_text_from_entities(entities)
+    elif intent == "weather":
+        dispatch["forward_text"] = build_weather_text_from_entities(entities)
+    elif intent == "news":
+        dispatch["forward_text"] = build_news_command_from_entities(entities)
+    elif intent == "reminder":
+        dispatch["forward_text"] = build_reminder_text_from_entities(entities)
+
+    return dispatch
+
+
+def handle_ai_router(chat_id: int, text: str) -> bool:
+    dispatch = route_message_with_ai(text)
+    logger.info("AI router result: %s", dispatch)
+    intent = dispatch.get("intent")
+    forward_text = (dispatch.get("forward_text") or "").strip()
+    entities = dispatch.get("entities") or {}
+
+    if intent == "food" and forward_text:
+        handle_food(chat_id, forward_text)
+        return True
+
+    if intent == "weather" and forward_text:
+        handle_weather(chat_id, forward_text)
+        return True
+
+    if intent == "news" and forward_text:
+        handle_news(chat_id, forward_text)
+        return True
+
+    if intent == "reminder":
+        operation = str(entities.get("operation") or dispatch.get("action") or "create").lower()
+        if operation == "list":
+            handle_list(chat_id)
+            return True
+        if operation == "cancel":
+            if forward_text == "/cancel_all":
+                handle_cancel_all(chat_id)
+                return True
+            if forward_text and handle_cancel_by_keyword(chat_id, forward_text):
+                return True
+            return False
+        if forward_text and try_handle_event_reminder(chat_id, forward_text):
+            return True
+
+    return False
+
+
+
 def parse_db_datetime(value: Any) -> datetime:
     if isinstance(value, datetime):
         dt = value
@@ -857,7 +1200,7 @@ def send_location_request_for_food(chat_id: int, query_info: Dict[str, Any]) -> 
         "text": (
             f"📍 這次要找 {title}。\n"
             f"目前沒有指定城市，我需要你的定位來查附近約 {km} 公里內的店家。\n"
-            f"{budget_hint}｜篩選 Google 評分 4.5 以上\n\n"
+            f"{budget_hint}｜篩選 Google 評分 {DEFAULT_FOOD_MIN_RATING}~{DEFAULT_FOOD_MAX_RATING}｜評論數 {DEFAULT_FOOD_MIN_REVIEWS}+\n\n"
             "請按下方按鈕分享目前位置。"
         ),
         "reply_markup": {
@@ -2683,8 +3026,13 @@ def telegram_webhook():
             if try_handle_multiple_event_reminders(chat_id, text):
                 return jsonify({"ok": True})
 
-            if not try_handle_event_reminder(chat_id, text):
-                handle_unknown(chat_id)
+            if try_handle_event_reminder(chat_id, text):
+                return jsonify({"ok": True})
+
+            if handle_ai_router(chat_id, text):
+                return jsonify({"ok": True})
+
+            handle_unknown(chat_id)
 
         return jsonify({"ok": True})
 
