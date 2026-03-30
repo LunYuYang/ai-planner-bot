@@ -6,9 +6,14 @@ on:
       - main
   workflow_dispatch:
 
+concurrency:
+  group: deploy-production
+  cancel-in-progress: true
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Deploy via SSH
@@ -17,33 +22,50 @@ jobs:
           host: ${{ secrets.VM_HOST }}
           username: ${{ secrets.VM_USER }}
           key: ${{ secrets.VM_SSH_KEY }}
+          script_stop: true
           script: |
-            set -e
+            set -Eeuo pipefail
 
-            cd ~/ai-planner-bot
+            APP_DIR="$HOME/ai-planner-bot"
+            SERVICE_NAME="tg-bot"
+            HEALTH_URL="http://127.0.0.1:5000/health"
 
-            echo "==> Fetch latest code"
-            git fetch origin
+            echo "==> Go to app dir"
+            cd "$APP_DIR"
+
+            echo "==> Sync code"
+            git fetch origin main
             git reset --hard origin/main
+
+            echo "==> Check env file"
+            test -f .env
 
             echo "==> Activate venv"
             source venv/bin/activate
+            python --version
 
             echo "==> Install / update dependencies"
+            pip install --upgrade pip
             pip install -r requirements.txt
 
-            echo "==> Restart systemd service"
+            echo "==> Syntax check"
+            python -m py_compile app.py config.py db.py telegram_api.py
+
+            echo "==> Restart service"
             sudo systemctl daemon-reload
-            sudo systemctl restart tg-bot || true
+            sudo systemctl restart "$SERVICE_NAME"
+
+            echo "==> Wait for boot"
+            for i in {1..20}; do
+              if curl -fsS "$HEALTH_URL" >/dev/null; then
+                echo "Health check passed"
+                break
+              fi
+              sleep 2
+            done
+
+            echo "==> Final health check"
+            curl -fsS "$HEALTH_URL"
 
             echo "==> Service status"
-            sudo systemctl status tg-bot --no-pager || true
-
-            echo "==> Wait app boot"
-            sleep 5
-
-            echo "==> Health check"
-            curl -fsS http://127.0.0.1:5000/health || true
-
-            echo "==> Home check"
-            curl -fsS http://127.0.0.1:5000/ || true
+            sudo systemctl status "$SERVICE_NAME" --no-pager
