@@ -913,6 +913,11 @@ FOOD_TRIGGER_PATTERNS = [kw for kws in FOOD_KEYWORDS.values() for kw in kws] + [
     "nearby lunch", "nearby dinner", "nearby late night"
 ]
 
+FOOD_INTENT_HINTS = [
+    "想吃", "推薦", "推薦我", "推我", "吃什麼", "找吃的", "有什麼好吃", "我也想", "我想吃", "我想吃點",
+    "吃點什麼", "附近有什麼", "幫我找", "找一下", "宵夜推薦", "晚餐推薦", "午餐推薦", "早餐推薦",
+]
+
 DEFAULT_FOOD_RADIUS_METERS = 3000
 DEFAULT_FOOD_LIMIT = 5
 DEFAULT_FOOD_MIN_RATING = 4.5
@@ -960,7 +965,15 @@ def is_food_query(text: str) -> bool:
         return False
     if normalized.startswith("/food"):
         return True
-    return any(normalize_food_text(token) in normalized for token in FOOD_TRIGGER_PATTERNS)
+    if any(normalize_food_text(token) in normalized for token in FOOD_TRIGGER_PATTERNS):
+        return True
+
+    has_food_hint = any(normalize_food_text(token) in normalized for token in FOOD_INTENT_HINTS)
+    has_food_noun = any(normalize_food_text(token) in normalized for token in (
+        "美食", "小吃", "早餐", "早午餐", "午餐", "晚餐", "宵夜", "餐廳", "吃飯", "麵店", "晚餐", "午餐"
+    ))
+    has_budget = bool(re.search(r"\d{2,5}\s*[~～\-到至]\s*\d{2,5}", normalized))
+    return has_food_hint and (has_food_noun or has_budget)
 
 
 def detect_food_mode(text: str) -> str:
@@ -1277,7 +1290,7 @@ def handle_food_location_message(chat_id: int, location: Dict[str, Any]) -> None
 def handle_food(chat_id: int, text: str) -> None:
     register_chat_id(chat_id)
     if not GOOGLE_MAPS_API_KEY:
-        send_message(chat_id, "目前尚未設定 GOOGLE_MAPS_API_KEY，所以還不能查美食地圖。")
+        send_message(chat_id, "目前執行中的 bot 尚未讀到 GOOGLE_MAPS_API_KEY，所以暫時不能查美食地圖。請先確認 VM 的 .env 與 service 已重新載入。")
         return
 
     query = parse_food_query(text)
@@ -1984,8 +1997,35 @@ def parse_date_token(token: str, now: datetime) -> Optional[datetime.date]:
     return None
 
 
+
+REMINDER_PREFIX_PATTERN = re.compile(
+    r"^\s*(提醒我|提醒|叫我|通知我|幫我提醒|幫我記得|記得提醒我|記得|麻煩提醒我|麻煩提醒)\s*",
+    re.IGNORECASE,
+)
+
+
+def strip_reminder_prefix(text: str) -> str:
+    return REMINDER_PREFIX_PATTERN.sub("", (text or "").strip(), count=1)
+
+
+def is_likely_reminder_query(text: str) -> bool:
+    raw = (text or "").strip()
+    if not raw:
+        return False
+    if REMINDER_PREFIX_PATTERN.match(raw):
+        return True
+    raw_n = normalize_chinese_time_text(raw)
+    if re.search(r"\b\d{1,2}:\d{2}\b", raw_n):
+        return True
+    if re.search(r"(今天|明天|後天|大後天|下週|下周|這週|這周).{0,8}(\d{1,2})(?::|點)", raw_n):
+        return True
+    if re.search(r"(\d+)\s*(分鐘|分|min|mins|minute|minutes|小時|hr|hrs|hour|hours)\s*後", raw_n, re.IGNORECASE):
+        return True
+    return False
+
+
 def parse_relative_reminder(text: str) -> Optional[Dict[str, Any]]:
-    raw = normalize_chinese_time_text(text.strip())
+    raw = normalize_chinese_time_text(strip_reminder_prefix(text.strip()))
     now = datetime.now(TZINFO)
 
     m = re.match(
@@ -2007,7 +2047,7 @@ def parse_relative_reminder(text: str) -> Optional[Dict[str, Any]]:
 
 
 def parse_absolute_reminder(text: str) -> Optional[Dict[str, Any]]:
-    raw = normalize_chinese_time_text(text.strip())
+    raw = normalize_chinese_time_text(strip_reminder_prefix(text.strip()))
     now = datetime.now(TZINFO)
 
     date_token, rest = split_date_and_rest(raw)
@@ -3044,13 +3084,19 @@ def telegram_webhook():
             if handle_cancel_by_keyword(chat_id, text):
                 return jsonify({"ok": True})
 
+            if is_likely_reminder_query(text):
+                if try_handle_multiple_event_reminders(chat_id, text):
+                    return jsonify({"ok": True})
+                if try_handle_event_reminder(chat_id, text):
+                    return jsonify({"ok": True})
+
+            if handle_ai_router(chat_id, text):
+                return jsonify({"ok": True})
+
             if try_handle_multiple_event_reminders(chat_id, text):
                 return jsonify({"ok": True})
 
             if try_handle_event_reminder(chat_id, text):
-                return jsonify({"ok": True})
-
-            if handle_ai_router(chat_id, text):
                 return jsonify({"ok": True})
 
             handle_unknown(chat_id)
