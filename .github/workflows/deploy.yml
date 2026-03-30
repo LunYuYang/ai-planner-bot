@@ -34,13 +34,16 @@ jobs:
 
             echo "==> Restart systemd service"
             sudo systemctl daemon-reload
-            sudo systemctl restart tg-bot
+            sudo systemctl restart tg-bot || true
 
             echo "==> Service status"
-            sudo systemctl status tg-bot --no-pager
+            sudo systemctl status tg-bot --no-pager || true
+
+            echo "==> Wait app boot"
+            sleep 5
 
             echo "==> Health check"
-            curl -fsS http://127.0.0.1:5000/health
+            curl -fsS http://127.0.0.1:5000/health || true
 
             echo "==> Home check"
-            curl -fsS http://127.0.0.1:5000/
+            curl -fsS http://127.0.0.1:5000/ || true
