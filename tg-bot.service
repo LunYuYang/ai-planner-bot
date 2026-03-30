@@ -1,0 +1,21 @@
+[Unit]
+Description=Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/ai-planner-bot
+EnvironmentFile=/home/ubuntu/ai-planner-bot/.env
+ExecStart=/home/ubuntu/ai-planner-bot/venv/bin/python -u /home/ubuntu/ai-planner-bot/app.py
+Restart=always
+RestartSec=5
+TimeoutStartSec=60
+KillSignal=SIGINT
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tg-bot
+
+[Install]
+WantedBy=multi-user.target
