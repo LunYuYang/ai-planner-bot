@@ -19,10 +19,28 @@ jobs:
           key: ${{ secrets.VM_SSH_KEY }}
           script: |
             set -e
+
             cd ~/ai-planner-bot
+
+            echo "==> Fetch latest code"
             git fetch origin
             git reset --hard origin/main
+
+            echo "==> Activate venv"
             source venv/bin/activate
-            export $(cat .env | xargs)
+
+            echo "==> Install / update dependencies"
+            pip install -r requirements.txt
+
+            echo "==> Restart systemd service"
+            sudo systemctl daemon-reload
             sudo systemctl restart tg-bot
+
+            echo "==> Service status"
             sudo systemctl status tg-bot --no-pager
+
+            echo "==> Health check"
+            curl -fsS http://127.0.0.1:5000/health
+
+            echo "==> Home check"
+            curl -fsS http://127.0.0.1:5000/
