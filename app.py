@@ -255,9 +255,9 @@ def heuristic_intent_router(text: str) -> Dict[str, Any]:
             "entities": {"topic": topic, "time_range": "today", "format": "short"},
         })
 
-    # reminder list/cancel
-    if "提醒" in raw:
-        if any(token in raw for token in ["有哪些提醒", "目前提醒", "查看提醒", "列出提醒", "提醒列表"]):
+    # reminder list/cancel/create
+    if any(token in raw for token in ["提醒", "叫我", "通知我"]):
+        if any(token in raw for token in ["有哪些提醒", "目前提醒", "查看提醒", "列出提醒", "提醒列表", "看提醒", "有哪些行程"]):
             return merge_ai_router_default({
                 "intent": "reminder",
                 "action": "list",
@@ -270,20 +270,41 @@ def heuristic_intent_router(text: str) -> Dict[str, Any]:
                 "action": "cancel",
                 "entities": {"operation": "cancel", "message": msg},
             })
-        # 例如 提醒我20:00要離開學校 / 提醒我 明天晚上七點 打球
-        m = re.match(r"^\s*提醒我\s*(.+?)\s*要\s*(.+?)\s*$", raw)
+
+        normalized_raw = re.sub(r"\s+", "", raw)
+        for pattern in [
+            r"^提醒我(?P<time>.+?)要(?P<msg>.+)$",
+            r"^提醒我(?P<time>.+?)(?P<msg>(?:回家|離開.+|出門|打球|開會|吃飯|吃早餐|喝水|洗衣服|睡覺).*)$",
+            r"^提醒我(?P<time>.+?)(?P<msg>[一-鿿A-Za-z].+)$",
+            r"^叫我(?P<time>.+?)要(?P<msg>.+)$",
+            r"^通知我(?P<time>.+?)要(?P<msg>.+)$",
+        ]:
+            m = re.match(pattern, normalized_raw)
+            if m:
+                return merge_ai_router_default({
+                    "intent": "reminder",
+                    "action": "create",
+                    "entities": {
+                        "operation": "create",
+                        "time_text": m.group("time").strip(),
+                        "message": m.group("msg").strip(),
+                    },
+                })
+
+        # 例如 提醒我 20:00 離開學校 / 提醒我 明天晚上七點 打球
+        m = re.match(r"^\s*(提醒我|叫我|通知我)\s*(.+?)\s*要\s*(.+?)\s*$", raw)
         if m:
             return merge_ai_router_default({
                 "intent": "reminder",
                 "action": "create",
-                "entities": {"operation": "create", "time_text": m.group(1).strip(), "message": m.group(2).strip()},
+                "entities": {"operation": "create", "time_text": m.group(2).strip(), "message": m.group(3).strip()},
             })
-        m = re.match(r"^\s*提醒我\s*(.+?)\s+(.+?)\s*$", raw)
+        m = re.match(r"^\s*(提醒我|叫我|通知我)\s*(.+?)\s+(.+?)\s*$", raw)
         if m:
             return merge_ai_router_default({
                 "intent": "reminder",
                 "action": "create",
-                "entities": {"operation": "create", "time_text": m.group(1).strip(), "message": m.group(2).strip()},
+                "entities": {"operation": "create", "time_text": m.group(2).strip(), "message": m.group(3).strip()},
             })
 
     return ai_router_default()
