@@ -498,16 +498,32 @@ def parse_db_datetime(value: Any) -> datetime:
 
 RSS_FEEDS = {
     "tech": [
-        "https://news.google.com/rss/headlines/section/topic/TECHNOLOGY?hl=en-US&gl=US&ceid=US:en",
-        "https://feeds.npr.org/1019/rss.xml",
-        "https://news.google.com/rss/search?q=AI+OR+artificial+intelligence+OR+OpenAI+OR+NVIDIA+OR+Google+DeepMind&hl=en-US&gl=US&ceid=US:en",
+        "https://www.cnbc.com/id/19854910/device/rss/rss.html",
+        "https://feeds.arstechnica.com/arstechnica/index",
+        "https://www.theverge.com/rss/index.xml",
+        "https://news.google.com/rss/search?q=AI+OR+artificial+intelligence+OR+OpenAI+OR+NVIDIA+OR+TSMC+OR+semiconductor+OR+foundry+OR+server+OR+datacenter&hl=en-US&gl=US&ceid=US:en",
     ],
     "business": [
-        "https://news.google.com/rss/headlines/section/topic/BUSINESS?hl=en-US&gl=US&ceid=US:en",
-        "https://news.google.com/rss/search?q=finance+OR+stock+OR+market+OR+economy+OR+earnings+OR+Federal+Reserve&hl=en-US&gl=US&ceid=US:en",
+        "https://www.cnbc.com/id/10000664/device/rss/rss.html",
+        "https://news.google.com/rss/search?q=earnings+OR+guidance+OR+revenue+OR+margin+OR+capex+OR+shipment+OR+demand+OR+inventory+OR+Fed+OR+inflation+OR+bond+yield&hl=en-US&gl=US&ceid=US:en",
+        "https://news.google.com/rss/search?q=technology+earnings+OR+semiconductor+earnings+OR+AI+infrastructure+spending+OR+cloud+capex&hl=en-US&gl=US&ceid=US:en",
     ],
 }
 
+
+TECH_NEWS_KEYWORDS = [
+    "ai", "artificial intelligence", "openai", "nvidia", "amd", "intel", "qualcomm",
+    "semiconductor", "chip", "chips", "tsmc", "foundry", "wafer", "gpu", "cpu",
+    "datacenter", "server", "cloud", "microsoft", "google", "amazon", "meta",
+    "apple", "tesla", "broadcom", "asml", "memory", "hbm", "packaging"
+]
+
+FUNDAMENTAL_KEYWORDS = [
+    "earnings", "guidance", "revenue", "margin", "gross margin", "operating margin",
+    "capex", "capital expenditure", "shipment", "shipments", "inventory", "demand",
+    "order", "orders", "backlog", "forecast", "outlook", "fed", "inflation",
+    "interest rate", "bond yield", "tariff", "subsidy", "buyback", "dividend"
+]
 
 def load_chat_ids() -> List[int]:
     if not os.path.exists(CHAT_FILE):
@@ -628,8 +644,39 @@ def build_raw_summary(entry: Dict[str, Any], source_name: str) -> str:
     return f"Latest report from {source_name}. Open the link for full details."
 
 
+
+def classify_news_theme(title: str, raw_summary: str) -> str:
+    haystack = f"{title} {raw_summary}".lower()
+    if any(k in haystack for k in ("fed", "inflation", "interest rate", "bond yield", "cpi", "ppi", "payroll")):
+        return "總體經濟"
+    if any(k in haystack for k in ("earnings", "guidance", "revenue", "margin", "capex", "inventory", "demand", "outlook", "shipment", "shipments")):
+        return "基本面"
+    if any(k in haystack for k in ("semiconductor", "chip", "chips", "tsmc", "foundry", "wafer", "hbm", "packaging", "asml")):
+        return "半導體"
+    if any(k in haystack for k in ("ai", "openai", "nvidia", "gpu", "server", "datacenter", "cloud", "llm")):
+        return "AI / 雲端"
+    return "科技 / 財經"
+
+
+def score_news_item(item: Dict[str, Any]) -> int:
+    haystack = f"{item.get('title', '')} {item.get('raw_summary', '')}".lower()
+    score = 0
+    for keyword in TECH_NEWS_KEYWORDS:
+        if keyword in haystack:
+            score += 3
+    for keyword in FUNDAMENTAL_KEYWORDS:
+        if keyword in haystack:
+            score += 4
+    for keyword in ["nvidia", "tsmc", "apple", "microsoft", "google", "meta", "amazon", "amd", "intel", "broadcom", "asml", "tesla"]:
+        if keyword in haystack:
+            score += 2
+    if item.get("category") == "tech":
+        score += 1
+    return score
+
+
 def summarize_to_chinese(title: str, raw_summary: str, source_name: str) -> str:
-    fallback = trim_text(raw_summary, 110)
+    fallback = trim_text(raw_summary, 120)
 
     if not ENABLE_CHINESE_SUMMARY:
         return fallback
@@ -638,17 +685,22 @@ def summarize_to_chinese(title: str, raw_summary: str, source_name: str) -> str:
         logger.warning("OPENAI_API_KEY not set, fallback to raw summary.")
         return fallback
 
+    theme = classify_news_theme(title, raw_summary)
+
     try:
         prompt = f"""
-請將以下科技、AI、商業或財經新聞整理成繁體中文摘要。
+請將以下新聞整理成適合關注科技業、AI、半導體與財經基本面的繁體中文重點。
 
-要求：
-1. 使用繁體中文
-2. 30~60字左右
-3. 精簡、自然、像新聞快報
-4. 不要加入未提供的推測
-5. 優先保留公司、產品、產業與商業重點
-6. 只輸出摘要，不要加「摘要：」
+輸出規則：
+1. 60~110字
+2. 聚焦基本面與產業影響，不要流水帳
+3. 優先寫出：營收/毛利/資本支出/需求/庫存/出貨/指引/Fed/通膨 等重點
+4. 如果是科技新聞，優先點出對 AI、半導體、供應鏈、雲端資本支出的影響
+5. 如果是總經或財經新聞，優先點出對股市、利率、風險偏好的影響
+6. 只輸出一段摘要，不要加標題或條列符號
+
+新聞主題：
+{theme}
 
 新聞標題：
 {title}
@@ -663,17 +715,20 @@ def summarize_to_chinese(title: str, raw_summary: str, source_name: str) -> str:
         resp = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[
-                {"role": "system", "content": "你是擅長整理國際科技、AI、商業與財經新聞的繁體中文編輯，輸出精簡、清楚、自然。"},
+                {
+                    "role": "system",
+                    "content": "你是擅長科技產業、AI供應鏈、半導體與財經基本面的繁體中文市場編輯。輸出要精簡、具資訊密度、強調產業與基本面影響。"
+                },
                 {"role": "user", "content": prompt},
             ],
-            temperature=0.3,
-            max_tokens=120,
+            temperature=0.2,
+            max_tokens=180,
         )
 
         content = (resp.choices[0].message.content or "").strip()
         content = re.sub(r"^摘要[:：]\s*", "", content)
         content = re.sub(r"\s+", " ", content).strip()
-        return trim_text(content, 110) if content else fallback
+        return trim_text(content, 120) if content else fallback
     except Exception as e:
         logger.exception("Chinese summary failed: %s", e)
         return fallback
@@ -728,6 +783,8 @@ def fetch_news(category: str = "all", limit: int = DEFAULT_NEWS_LIMIT) -> List[D
                         continue
                     if link_key and link_key in seen_links:
                         continue
+                    item["theme"] = classify_news_theme(item["title"], item["raw_summary"])
+                    item["priority_score"] = score_news_item(item)
                     seen_titles.add(title_key)
                     if link_key:
                         seen_links.add(link_key)
@@ -735,37 +792,32 @@ def fetch_news(category: str = "all", limit: int = DEFAULT_NEWS_LIMIT) -> List[D
             except Exception as e:
                 logger.exception("Failed to parse feed %s: %s", feed_url, e)
 
-    all_items.sort(key=lambda x: x.get("published_ts", 0), reverse=True)
+    all_items.sort(key=lambda x: (x.get("priority_score", 0), x.get("published_ts", 0)), reverse=True)
 
     if category == "all":
-        tech_items = [x for x in all_items if x["category"] == "tech"]
-        biz_items = [x for x in all_items if x["category"] == "business"]
+        buckets = {
+            "AI / 雲端": [],
+            "半導體": [],
+            "基本面": [],
+            "總體經濟": [],
+            "科技 / 財經": [],
+        }
+        for item in all_items:
+            buckets.setdefault(item.get("theme", "科技 / 財經"), []).append(item)
 
         mixed: List[Dict[str, Any]] = []
-        mixed.extend(tech_items[: min(3, len(tech_items))])
+        for bucket_name in ["AI / 雲端", "半導體", "基本面", "總體經濟", "科技 / 財經"]:
+            if buckets.get(bucket_name):
+                mixed.append(buckets[bucket_name][0])
 
-        remaining = limit - len(mixed)
-        if remaining > 0:
-            mixed.extend(biz_items[:remaining])
-
-        remaining = limit - len(mixed)
-        if remaining > 0:
-            used = {x["title_norm"] for x in mixed}
-            for item in tech_items[3:]:
-                if item["title_norm"] not in used:
-                    mixed.append(item)
-                    used.add(item["title_norm"])
-                if len(mixed) >= limit:
-                    break
-
-        if len(mixed) < limit:
-            used = {x["title_norm"] for x in mixed}
-            for item in biz_items:
-                if item["title_norm"] not in used:
-                    mixed.append(item)
-                    used.add(item["title_norm"])
-                if len(mixed) >= limit:
-                    break
+        used = {x["title_norm"] for x in mixed}
+        for item in all_items:
+            if item["title_norm"] in used:
+                continue
+            mixed.append(item)
+            used.add(item["title_norm"])
+            if len(mixed) >= limit:
+                break
 
         return mixed[:limit]
 
@@ -789,11 +841,11 @@ def format_news_message(items: List[Dict[str, Any]], category: str = "all", incl
     now_str = datetime.now(TZINFO).strftime("%Y-%m-%d %H:%M")
 
     if category == "tech":
-        title = "🧠 今日科技 / AI 新聞"
+        title = "🧠 今日科技 / AI / 半導體重點"
     elif category == "business":
-        title = "💼 今日商業 / 財經新聞"
+        title = "💼 今日財經 / 基本面重點"
     else:
-        title = "🗞️ 今日科技 / AI / 商業 / 財經新聞"
+        title = "🗞️ 今日科技業 / 財經基本面重點"
 
     if not items:
         return f"{title}\n更新時間：{now_str}\n\n目前抓不到新聞，請稍後再試。"
@@ -801,9 +853,10 @@ def format_news_message(items: List[Dict[str, Any]], category: str = "all", incl
     lines = [title, f"更新時間：{now_str}", ""]
 
     for idx, item in enumerate(items, start=1):
-        block = [f"{idx}. {item['title']}"]
+        theme = item.get("theme", "科技 / 財經")
+        block = [f"{idx}. 【{theme}】{item['title']}"]
         if include_summary:
-            block.append(f"摘要：{item.get('summary') or item.get('raw_summary') or ''}")
+            block.append(f"重點：{item.get('summary') or item.get('raw_summary') or ''}")
         block.append(f"來源：{item['source']}")
         if item["link"]:
             block.append(item["link"])
@@ -817,28 +870,29 @@ def format_news_message(items: List[Dict[str, Any]], category: str = "all", incl
 
 
 def parse_news_command(text: str) -> Dict[str, Any]:
-    parts = text.strip().split()
+    raw = text.strip()
+    lowered = raw.lower()
     category = DEFAULT_NEWS_CATEGORY
     limit = DEFAULT_NEWS_LIMIT
 
-    if len(parts) >= 2:
-        arg1 = parts[1].lower()
-        if arg1 in ("tech", "technology", "ai", "科技"):
-            category = "tech"
-        elif arg1 in ("business", "biz", "finance", "財經", "商業", "商務"):
-            category = "business"
-        elif arg1 in ("all", "全部"):
-            category = "all"
-        elif arg1.isdigit():
-            limit = max(1, min(10, int(arg1)))
+    if any(token in lowered for token in ("ai", "科技", "tech", "半導體", "chip", "晶片", "semiconductor")):
+        category = "tech"
+    elif any(token in lowered for token in ("財經", "商業", "business", "finance", "基本面", "總經", "fed", "通膨")):
+        category = "business"
 
-    if len(parts) >= 3:
-        arg2 = parts[2].lower()
-        if arg2.isdigit():
-            limit = max(1, min(10, int(arg2)))
+    parts = raw.split()
+    for token in parts[1:]:
+        token_l = token.lower()
+        if token_l in ("tech", "technology", "ai", "科技", "半導體", "semiconductor", "chip", "晶片"):
+            category = "tech"
+        elif token_l in ("business", "biz", "finance", "財經", "商業", "商務", "基本面", "總經"):
+            category = "business"
+        elif token_l in ("all", "全部"):
+            category = "all"
+        elif token_l.isdigit():
+            limit = max(1, min(10, int(token_l)))
 
     return {"category": category, "limit": limit}
-
 
 
 
@@ -913,11 +967,6 @@ FOOD_TRIGGER_PATTERNS = [kw for kws in FOOD_KEYWORDS.values() for kw in kws] + [
     "nearby lunch", "nearby dinner", "nearby late night"
 ]
 
-FOOD_INTENT_HINTS = [
-    "想吃", "推薦", "推薦我", "推我", "吃什麼", "找吃的", "有什麼好吃", "我也想", "我想吃", "我想吃點",
-    "吃點什麼", "附近有什麼", "幫我找", "找一下", "宵夜推薦", "晚餐推薦", "午餐推薦", "早餐推薦",
-]
-
 DEFAULT_FOOD_RADIUS_METERS = 3000
 DEFAULT_FOOD_LIMIT = 5
 DEFAULT_FOOD_MIN_RATING = 4.5
@@ -965,15 +1014,7 @@ def is_food_query(text: str) -> bool:
         return False
     if normalized.startswith("/food"):
         return True
-    if any(normalize_food_text(token) in normalized for token in FOOD_TRIGGER_PATTERNS):
-        return True
-
-    has_food_hint = any(normalize_food_text(token) in normalized for token in FOOD_INTENT_HINTS)
-    has_food_noun = any(normalize_food_text(token) in normalized for token in (
-        "美食", "小吃", "早餐", "早午餐", "午餐", "晚餐", "宵夜", "餐廳", "吃飯", "麵店", "晚餐", "午餐"
-    ))
-    has_budget = bool(re.search(r"\d{2,5}\s*[~～\-到至]\s*\d{2,5}", normalized))
-    return has_food_hint and (has_food_noun or has_budget)
+    return any(normalize_food_text(token) in normalized for token in FOOD_TRIGGER_PATTERNS)
 
 
 def detect_food_mode(text: str) -> str:
@@ -1290,7 +1331,7 @@ def handle_food_location_message(chat_id: int, location: Dict[str, Any]) -> None
 def handle_food(chat_id: int, text: str) -> None:
     register_chat_id(chat_id)
     if not GOOGLE_MAPS_API_KEY:
-        send_message(chat_id, "目前執行中的 bot 尚未讀到 GOOGLE_MAPS_API_KEY，所以暫時不能查美食地圖。請先確認 VM 的 .env 與 service 已重新載入。")
+        send_message(chat_id, "目前尚未設定 GOOGLE_MAPS_API_KEY，所以還不能查美食地圖。")
         return
 
     query = parse_food_query(text)
@@ -1997,35 +2038,8 @@ def parse_date_token(token: str, now: datetime) -> Optional[datetime.date]:
     return None
 
 
-
-REMINDER_PREFIX_PATTERN = re.compile(
-    r"^\s*(提醒我|提醒|叫我|通知我|幫我提醒|幫我記得|記得提醒我|記得|麻煩提醒我|麻煩提醒)\s*",
-    re.IGNORECASE,
-)
-
-
-def strip_reminder_prefix(text: str) -> str:
-    return REMINDER_PREFIX_PATTERN.sub("", (text or "").strip(), count=1)
-
-
-def is_likely_reminder_query(text: str) -> bool:
-    raw = (text or "").strip()
-    if not raw:
-        return False
-    if REMINDER_PREFIX_PATTERN.match(raw):
-        return True
-    raw_n = normalize_chinese_time_text(raw)
-    if re.search(r"\b\d{1,2}:\d{2}\b", raw_n):
-        return True
-    if re.search(r"(今天|明天|後天|大後天|下週|下周|這週|這周).{0,8}(\d{1,2})(?::|點)", raw_n):
-        return True
-    if re.search(r"(\d+)\s*(分鐘|分|min|mins|minute|minutes|小時|hr|hrs|hour|hours)\s*後", raw_n, re.IGNORECASE):
-        return True
-    return False
-
-
 def parse_relative_reminder(text: str) -> Optional[Dict[str, Any]]:
-    raw = normalize_chinese_time_text(strip_reminder_prefix(text.strip()))
+    raw = normalize_chinese_time_text(text.strip())
     now = datetime.now(TZINFO)
 
     m = re.match(
@@ -2047,7 +2061,7 @@ def parse_relative_reminder(text: str) -> Optional[Dict[str, Any]]:
 
 
 def parse_absolute_reminder(text: str) -> Optional[Dict[str, Any]]:
-    raw = normalize_chinese_time_text(strip_reminder_prefix(text.strip()))
+    raw = normalize_chinese_time_text(text.strip())
     now = datetime.now(TZINFO)
 
     date_token, rest = split_date_and_rest(raw)
@@ -3084,19 +3098,13 @@ def telegram_webhook():
             if handle_cancel_by_keyword(chat_id, text):
                 return jsonify({"ok": True})
 
-            if is_likely_reminder_query(text):
-                if try_handle_multiple_event_reminders(chat_id, text):
-                    return jsonify({"ok": True})
-                if try_handle_event_reminder(chat_id, text):
-                    return jsonify({"ok": True})
-
-            if handle_ai_router(chat_id, text):
-                return jsonify({"ok": True})
-
             if try_handle_multiple_event_reminders(chat_id, text):
                 return jsonify({"ok": True})
 
             if try_handle_event_reminder(chat_id, text):
+                return jsonify({"ok": True})
+
+            if handle_ai_router(chat_id, text):
                 return jsonify({"ok": True})
 
             handle_unknown(chat_id)
