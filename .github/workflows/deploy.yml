@@ -6,9 +6,14 @@ on:
       - main
   workflow_dispatch:
 
+concurrency:
+  group: tg-bot-deploy
+  cancel-in-progress: true
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Deploy via SSH
@@ -17,25 +22,46 @@ jobs:
           host: ${{ secrets.VM_HOST }}
           username: ${{ secrets.VM_USER }}
           key: ${{ secrets.VM_SSH_KEY }}
+          script_stop: true
           script: |
-            set -e
+            set -Eeuo pipefail
 
-            cd ~/ai-planner-bot
+            APP_DIR="$HOME/ai-planner-bot"
+            SERVICE_NAME="tg-bot"
 
-            echo "==> Pull latest code"
-            git fetch origin
+            echo "==> Enter app dir"
+            cd "$APP_DIR"
+
+            echo "==> Mark repo as safe"
+            git config --global --add safe.directory "$APP_DIR"
+
+            echo "==> Sync latest code"
+            git fetch --all --prune
             git reset --hard origin/main
+
+            echo "==> Ensure venv exists"
+            if [ ! -d venv ]; then
+              python3 -m venv venv
+            fi
 
             echo "==> Install dependencies"
             source venv/bin/activate
+            python -m pip install --upgrade pip
             pip install -r requirements.txt
 
-            echo "==> Reload & Restart service"
+            echo "==> Install/update systemd unit"
+            sudo cp tg-bot.service /etc/systemd/system/tg-bot.service
             sudo systemctl daemon-reload
-            sudo systemctl restart tg-bot
 
-            echo "==> Check status"
-            sudo systemctl status tg-bot --no-pager
+            echo "==> Restart service"
+            sudo systemctl restart "$SERVICE_NAME"
+
+            echo "==> Wait for service"
+            sleep 5
+
+            echo "==> Verify service status"
+            sudo systemctl is-active --quiet "$SERVICE_NAME"
+            sudo systemctl status "$SERVICE_NAME" --no-pager -l
 
             echo "==> Health check"
             curl -fsS http://127.0.0.1:5000/health
