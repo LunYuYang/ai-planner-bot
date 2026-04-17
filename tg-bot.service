@@ -1,5 +1,5 @@
 [Unit]
-Description=Telegram Bot
+Description=Telegram AI Planner Bot
 After=network-online.target
 Wants=network-online.target
 
@@ -8,6 +8,7 @@ Type=simple
 User=ubuntu
 WorkingDirectory=/home/ubuntu/ai-planner-bot
 EnvironmentFile=/home/ubuntu/ai-planner-bot/.env
+Environment=PYTHONUNBUFFERED=1
 ExecStart=/home/ubuntu/ai-planner-bot/venv/bin/python -u /home/ubuntu/ai-planner-bot/app.py
 Restart=always
 RestartSec=5
